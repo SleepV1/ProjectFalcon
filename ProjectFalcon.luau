@@ -1,7 +1,6 @@
--- Envy v1: standalone entry point. Run this file to cache this exact version.
+-- Project Falcon standalone launcher. Run this file to cache this exact version.
 local source = [====[
--- Falcon
--- loadstring(game:HttpGet("https://raw.githubusercontent.com/corapsez-ctrl/quantumware/main/bedwars.luau"))()
+-- Project Falcon
 -- Right Shift toggles the menu.
 
 local cloneref = cloneref or function(v)
@@ -69,7 +68,7 @@ local Life = { active=true, connections={}, resources={}, cleanups={}, jobId=gam
 do
 	local env = type(getgenv)=="function" and getgenv() or _G
 	local previous=env.EnvyV1Runtime or env.QuantumwareRuntime
-	if type(previous)=="table" and type(previous.Destroy)=="function" then pcall(previous.Destroy) end
+	if type(previous)=="table" and type(previous.Destroy)=="function" then pcall(previous.Destroy, true) end
 	env.QuantumwareRuntime=nil
 	Life.environment=env
 	env.EnvyV1Runtime=Life
@@ -810,7 +809,10 @@ local function sendAttack(target, targetRoot, mode, cfg)
 	if sent then attackState.targets[model] = now end
 	if sent and cfg.swing then
 		if mode == "silent" and Life.playLocalSwordSwing then
-			pcall(Life.playLocalSwordSwing)
+			local ok, played = pcall(Life.playLocalSwordSwing, weapon)
+			if not ok or not played then
+				return sent, "Attack submitted · " .. (ok and "swing rig unavailable" or ("swing error: " .. tostring(played)))
+			end
 		elseif BW.sword and type(BW.sword.playSwordEffect) == "function" then
 			pcall(BW.sword.playSwordEffect, BW.sword)
 		end
@@ -1366,7 +1368,9 @@ local function setOn(mod, state, silent)
 			notify(mod.name .. " failed to initialize. See F9 for details.")
 		end
 	end
-	if pushToast and not silent and not Life.destroying then
+	if pushToast and not silent and not Life.destroying
+		and not (Modules["No Notifications"] and Modules["No Notifications"].enabled)
+		and not (Modules["Clean HUD"] and Modules["Clean HUD"].enabled) then
 		local ok, err = pcall(pushToast, mod.name, mod.enabled)
 		if not ok then warn("[Falcon] Notification: " .. tostring(err)); notify(mod.name .. (mod.enabled and " enabled" or " disabled")) end
 	end
@@ -2415,6 +2419,17 @@ add("Combat", "Silent Aura", "Closet aura: visible targets in FOV, slower hits",
 	opt(m, "Priority", "list", "Distance", { list = { "Distance", "Health", "Angle" } })
 	opt(m, "Auto switch", "toggle", true)
 	opt(m, "Swing", "toggle", true)
+	opt(m, "Preview swing", "action", nil)
+	m.options["Preview swing"].callback = function()
+		local weapon = handTool()
+		if typeof(weapon) ~= "Instance" or not isSword({tool = weapon, itemType = weapon.Name}) then
+			m.status = "Equip a sword before previewing the swing"
+			return
+		end
+		local ok, played = pcall(Life.playLocalSwordSwing, weapon)
+		m.status = not ok and ("Swing error: " .. tostring(played))
+			or (played and "Playing swing preview" or "Swing rig unavailable")
+	end
 	opt(m, "Click only", "toggle", false)
 	opt(m, "Weapon cooldown", "toggle", true)
 end, function(on,m)
@@ -3289,40 +3304,103 @@ do
 end
 
 do
+	local animationType
+	local function playViewmodelSwing()
+		local controllers = BW.knit and BW.knit.Controllers
+		local controller = controllers and (controllers.ViewmodelController or controllers.ViewModelController)
+		if not controller or type(controller.playAnimation) ~= "function" then return end
+		if not animationType then
+			local ok, types = pcall(function()
+				return require(ReplicatedStorage.TS.animation["animation-type"]).AnimationType
+			end)
+			if ok then animationType = types end
+		end
+		local swing = animationType and (animationType.SWORD_SWING or animationType.SWORD_ATTACK or animationType.SWORD_SWING_1)
+		-- Older BedWars controllers accept the numeric swing slot without exporting a named constant.
+		local ok, result = pcall(controller.playAnimation, controller, swing or 15)
+		return ok and result ~= false
+	end
+
 	local started, moved, original, applied
+	local beforeAnimation, beforeSimulation, restoreJoint
 	local function restoreSwing()
 		if moved and moved.Parent and moved:GetPivot():FuzzyEq(applied) then moved:PivotTo(original) end
 		moved, original, applied = nil, nil, nil
 	end
-	function Life.playLocalSwordSwing()
-		if BW.sword and type(BW.sword.playSwordEffect) == "function" then
-			pcall(BW.sword.playSwordEffect, BW.sword)
-		end
-		if Modules["Hand Motion"].enabled and Life.previewSwordSwing and Life.previewSwordSwing() then return end
-		if started then return end
-		local camera = workspace.CurrentCamera
-		local rig = camera and Life.findViewmodel(camera)
-		if not rig or not rig:IsA("Model") then return end
-		started = os.clock()
-		RunService:BindToRenderStep("FalconAuraSwing", Enum.RenderPriority.Last.Value + 1, function()
-			restoreSwing()
-			local phase = (os.clock() - started) / 0.24
-			if phase >= 1 or workspace.CurrentCamera ~= camera or not rig:IsDescendantOf(camera) then
-				RunService:UnbindFromRenderStep("FalconAuraSwing")
-				started = nil
-				return
-			end
-			local arc = math.sin(math.pi * phase)
-			moved, original = rig, rig:GetPivot()
-			local offset = CFrame.new(-0.18 * arc, -0.30 * arc, 0) * CFrame.Angles(-0.66 * arc, 0.34 * arc, -0.58 * arc)
-			applied = camera.CFrame * offset * camera.CFrame:ToObjectSpace(original)
-			rig:PivotTo(applied)
-		end)
-	end
 	function Life.stopLocalSwordSwing()
+		if beforeAnimation then beforeAnimation:Disconnect(); beforeAnimation = nil end
+		if beforeSimulation then beforeSimulation:Disconnect(); beforeSimulation = nil end
 		RunService:UnbindFromRenderStep("FalconAuraSwing")
 		started = nil
+		if restoreJoint then restoreJoint(); restoreJoint = nil end
 		restoreSwing()
+	end
+	local function swingJoint(rig, weapon)
+		local armJoint
+		for _, joint in ipairs(rig:GetDescendants()) do
+			if joint:IsA("JointInstance") and joint.Part0 and joint.Part1 then
+				local name = joint.Name:lower():gsub("[%s_%-]", "")
+				local isGrip = name == "rightgrip" or (weapon and (joint.Part1 == weapon or joint.Part1:IsDescendantOf(weapon)))
+				if isGrip then return joint end
+				local arm = joint.Part1.Name:lower():gsub("[%s_%-]", "")
+				if not armJoint and joint:IsA("Motor6D") and (name == "rightshoulder" or name == "rightwrist"
+					or arm == "rightarm" or arm == "rightupperarm" or arm == "righthand") then
+					armJoint = joint
+				end
+			end
+		end
+		return armJoint
+	end
+	local function swingOffset(phase)
+		local arc = math.sin(math.pi * phase ^ 0.65) ^ 2
+		return CFrame.new(-0.18 * arc, -0.30 * arc, 0) * CFrame.Angles(-0.92 * arc, 0.45 * arc, -0.76 * arc)
+	end
+	function Life.playLocalSwordSwing(weapon)
+		if started then return true end
+		local nativePlayed = playViewmodelSwing()
+		local camera, character = workspace.CurrentCamera, char()
+		if not character then return nativePlayed end
+		local head = character:FindFirstChild("Head")
+		local firstPerson = camera and ((camera.CFrame.Position - camera.Focus.Position).Magnitude < 1.7
+			or (head and (camera.CFrame.Position - head.Position).Magnitude < 1.7))
+		local rig = firstPerson and Life.findViewmodel(camera)
+		local joint = rig and swingJoint(rig, weapon)
+		if not joint then joint = swingJoint(character, weapon) end
+		local canPivot = rig and rig:IsA("Model")
+		if not canPivot and not joint then return nativePlayed end
+		local base, drawn
+		local property = joint and (joint:IsA("Motor6D") and "Transform" or "C0")
+		restoreJoint = function()
+			if drawn and joint.Parent and joint[property]:FuzzyEq(drawn) then joint[property] = base end
+			drawn = nil
+		end
+		started = os.clock()
+		if joint then
+			beforeAnimation = RunService.PreAnimation:Connect(restoreJoint)
+			beforeSimulation = RunService.PreSimulation:Connect(function()
+				local phase = (os.clock() - started) / 0.26
+				if phase >= 1 or not joint.Parent or character ~= char() or camera ~= workspace.CurrentCamera then
+					Life.stopLocalSwordSwing()
+					return
+				end
+				base = joint[property]
+				drawn = base * swingOffset(phase)
+				joint[property] = drawn
+			end)
+		end
+		RunService:BindToRenderStep("FalconAuraSwing", Enum.RenderPriority.Last.Value + 1, function()
+			restoreSwing()
+			local phase = (os.clock() - started) / 0.26
+			if phase >= 1 or workspace.CurrentCamera ~= camera or character ~= char() then
+				Life.stopLocalSwordSwing()
+				return
+			end
+			if not canPivot or not rig:IsDescendantOf(camera) then return end
+			moved, original = rig, rig:GetPivot()
+			applied = camera.CFrame * swingOffset(phase) * camera.CFrame:ToObjectSpace(original)
+			rig:PivotTo(applied)
+		end)
+		return true
 	end
 end
 
@@ -3376,7 +3454,6 @@ do
 	end, function(on, m)
 		if not on then
 			RunService:UnbindFromRenderStep("FalconHandDraw")
-			Life.previewSwordSwing = nil
 			restorePose()
 			table.clear(joints)
 			table.clear(held)
@@ -3385,11 +3462,6 @@ do
 			return
 		end
 		m.status = "Waiting for first-person hands"
-		Life.previewSwordSwing = function()
-			if menuOpen or not rig or not rig.Parent then return false end
-			if not elapsed then startSwing(m) end
-			return true
-		end
 		table.insert(m.conns, UserInputService.InputBegan:Connect(function(input)
 			-- The game's action bindings can mark item use as processed.
 			if menuOpen or UserInputService:GetFocusedTextBox() or not useInput(input) then return end
@@ -6832,6 +6904,13 @@ end, function() resetMining() end, function(m)
 	end
 end, 0.05)
 
+add("Settings", "No Notifications", "Hide the bottom-right module toggle notifications", nil, function(on)
+	if on and Life.clearModuleToasts then Life.clearModuleToasts() end
+end)
+add("Settings", "Clean HUD", "Hide the menu and HUD on your screen. Press F8 to restore.", nil, function(on)
+	if Life.setCleanHud then Life.setCleanHud(on) end
+end)
+
 -- Profiles contain data only. Imports never execute the JSON contents.
 do
 	local SHARED="envy-v1"
@@ -6885,6 +6964,7 @@ local player=players.LocalPlayer
 while not player do task.wait();player=players.LocalPlayer end
 local root="envy-v1/users/" .. tostring(player.UserId) .. "/reset-1/"
 local http=game:GetService("HttpService")
+if not game:IsLoaded() then game.Loaded:Wait() end
 local ok,settings,ticket=pcall(function()
 	return http:JSONDecode(readfile(root .. "settings.json")),http:JSONDecode(readfile(root .. "teleport.json"))
 end)
@@ -6898,7 +6978,8 @@ local runtime=env.EnvyV1Runtime
 if runtime and runtime.active and runtime.jobId==game.JobId then return end
 local cached,source=pcall(readfile,"envy-v1/source.luau")
 if not cached or type(source)~="string" or source=="" then
-	source=game:HttpGet("https://raw.githubusercontent.com/corapsez-ctrl/quantumware/main/bedwars.luau?t=" .. tostring(os.time()))
+	warn("[Falcon] Cached script missing. Run ProjectFalcon.luau to refresh it.")
+	return
 end
 local run,err=loadstring(source)
 assert(run,err)
@@ -6925,13 +7006,15 @@ run()
 			local raw=HttpService:JSONEncode(preferences())
 			writefile(SETTINGS,raw)
 			assert(readfile(SETTINGS)==raw,"Settings write did not persist")
-			writefile(SHARED .. "/autoexec.luau",loader())
-			-- Refresh an existing autoexec install so it uses the account-specific settings path.
-			if type(isfile)=="function" and isfile("autoexec/envy-v1.luau") then
-				writefile("autoexec/envy-v1.luau",loader())
-			end
 			local source=Life.environment.EnvyV1Source
 			if type(source)=="string" and source~="" then writefile(SHARED .. "/source.luau",source) end
+			writefile(SHARED .. "/autoexec.luau",loader())
+			-- An executor may allow queueing while restricting writes to its autoexec directory.
+			pcall(function()
+				if type(isfile)=="function" and isfile("autoexec/envy-v1.luau") then
+					writefile("autoexec/envy-v1.luau",loader())
+				end
+			end)
 		end)
 		return ok,ok and SETTINGS or tostring(result)
 	end
@@ -6970,10 +7053,16 @@ run()
 		end)
 		if not ok then Config.lastError=tostring(result);status("Save failed: " .. tostring(result),true);return false end
 		Config.activeProfile=name
+		if loud and controls then
+			local field=controls.options.Profile
+			field.value=name
+			if field.paint then pcall(field.paint) end
+		end
 		Config.loadError=nil
 		local prefsOk,prefsErr=Config.writePreferences()
 		if not prefsOk then Config.lastError=tostring(prefsErr);status("Profile saved; preferences failed: " .. tostring(prefsErr),true);return false end
 		Config.lastError=nil
+		Config.revision=Config.revision+1
 		Config.dirty=false
 		Config.lastSave=os.clock()
 		Config.loaded=true
@@ -7088,7 +7177,7 @@ run()
 		Config.dirty=true
 		local revision=Config.revision
 		task.delay(0.6,function()
-			if not Life.active or Life.destroying or revision~=Config.revision then return end
+			if not Life.active or Life.destroying or revision~=Config.revision or not Config.dirty then return end
 			if Config.autosave and not Config.loadError then Config.save(Config.activeProfile,false)
 			else Config.writePreferences() end
 		end)
@@ -7139,9 +7228,10 @@ run()
 		clearTeleport()
 		Life.connect(lp.OnTeleport,function(state,destination)
 			if state==Enum.TeleportState.Failed then clearTeleport();return end
-			if state~=Enum.TeleportState.Started or Config.queued or not Config.autoExecute then return end
-			if Config.autosave and not Config.loadError then Config.save(Config.activeProfile,false) end
-			if not Config.writePreferences() then return end
+			if (state~=Enum.TeleportState.Started and state~=Enum.TeleportState.InProgress)
+				or Config.queued or not Config.autoExecute then return end
+			local saved,reason=Config.writePreferences()
+			if not saved then status("Could not prepare auto-execute: " .. tostring(reason),true);return end
 			local ok,id=pcall(function()
 				local ticketId=HttpService:GenerateGUID(false)
 				local raw=HttpService:JSONEncode({
@@ -7155,35 +7245,34 @@ run()
 			if not ok then status("Could not save teleport handoff: " .. tostring(id),true);return end
 			Config.queued=true
 			if Config.queueSupported then
-				local queued,err=pcall(queue,loader(id))
-				if not queued then status("Could not queue auto-execute: " .. tostring(err),true) end
+				local queued,result=pcall(queue,loader(id))
+				Config.queued=queued and result~=false
+				if not Config.queued then status("Could not queue auto-execute: " .. tostring(result),true) end
 			else
 				status("Teleport handoff saved for the installed auto-load script",false)
 			end
+			if Config.autosave and Config.dirty and not Config.loadError then Config.save(Config.activeProfile,false) end
 		end)
-		task.defer(function()
-			if not Life.active then return end
-			local plan=Config.pending or {}
-			if Config.startupAura ~= "Saved" then
-				for _, name in ipairs({"Killaura","Silent Aura"}) do
-					if Modules[name] then
-						plan[name]=plan[name] or {options={}}
-						plan[name].enabled=Config.startupAura==name
-					end
+		local plan=Config.pending or {}
+		if Config.startupAura ~= "Saved" then
+			for _, name in ipairs({"Killaura","Silent Aura"}) do
+				if Modules[name] then
+					plan[name]=plan[name] or {options={}}
+					plan[name].enabled=Config.startupAura==name
 				end
 			end
-			Config.restoring=true
-			for name,record in pairs(plan) do
-				if not record.enabled then setOn(Modules[name],false,true) end
-			end
-			for name,record in pairs(plan) do
-				if record.enabled then setOn(Modules[name],true,true) end
-			end
-			Config.pending=nil
-			Config.restoring=false
-			Config.dirty=false
-			status("Restored " .. Config.activeProfile .. " | Aura: " .. Config.snapshot().auraMode .. (Config.loadWarning and " | " .. Config.loadWarning or (Config.queueSupported and " | teleport queue ready" or " | use autoexec.luau for auto-launch")),Config.loadWarning~=nil)
-		end)
+		end
+		Config.restoring=true
+		for name,record in pairs(plan) do
+			if not record.enabled then setOn(Modules[name],false,true) end
+		end
+		for name,record in pairs(plan) do
+			if record.enabled then setOn(Modules[name],true,true) end
+		end
+		Config.pending=nil
+		Config.restoring=false
+		Config.dirty=false
+		status("Restored " .. Config.activeProfile .. " | Aura: " .. Config.snapshot().auraMode .. (Config.loadWarning and " | " .. Config.loadWarning or (Config.queueSupported and " | teleport queue ready" or " | use autoexec.luau for auto-launch")),Config.loadWarning~=nil)
 	end
 	controls=add("Settings","Configuration","Autosave, JSON profile sharing, and teleport auto-execution",function(m)
 		opt(m,"Autosave","toggle",true)
@@ -7213,14 +7302,18 @@ run()
 	end
 	local destroy=add("Settings","Self Destruct","Unloads modules, removes the menu/effects, and stops this instance")
 	destroy.action=function() if Life.Destroy then Life.Destroy() end end
-	function Life.Destroy()
+	function Life.Destroy(reloading)
 		if Life.destroying or not Life.active then return end
 		Life.destroying=true
 		if Life.stopLocalSwordSwing then pcall(Life.stopLocalSwordSwing) end
-		if Config.started and Config.autosave and not Config.loadError then pcall(Config.save,Config.activeProfile,false) end
-		Config.suspended=true
-		clearTeleport()
-		pcall(Config.writePreferences)
+		if Config.started and Config.autosave and Config.dirty and not Config.loadError then
+			pcall(Config.save,Config.activeProfile,false)
+		end
+		if not reloading then
+			Config.suspended=true
+			clearTeleport()
+			pcall(Config.writePreferences)
+		end
 		if Life.closePanel then pcall(Life.closePanel) end
 		for _,mod in pairs(Modules) do
 			if mod.enabled then
@@ -7310,7 +7403,7 @@ screen.ResetOnSpawn = false
 screen.IgnoreGuiInset = true
 screen.DisplayOrder = 999999
 screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-screen.Enabled = true
+screen.Enabled = false
 table.insert(Life.resources,screen)
 pcall(function()
 	if syn and syn.protect_gui then
@@ -7361,6 +7454,13 @@ toastList.VerticalAlignment = Enum.VerticalAlignment.Bottom
 toastList.SortOrder = Enum.SortOrder.LayoutOrder
 toastList.Parent = toasts
 local toastOrder = 0
+function Life.clearModuleToasts()
+	local children = toasts:GetChildren()
+	for index = #children, 1, -1 do
+		local child = children[index]
+		if child:IsA("Frame") then child:Destroy() end
+	end
+end
 pushToast = function(name, on)
 	if not Life.active then return end
 	toastOrder = toastOrder + 1
@@ -8306,12 +8406,29 @@ selectCategory("Combat")
 -- Open with an uncluttered settings inspector.
 
 menuOpen = overlay.Visible
+function Life.setCleanHud(on)
+	screen.Enabled = not on
+	notificationScreen.Enabled = not on
+	if on then
+		overlay.Visible = false
+		worldBlur.Enabled = false
+		menuOpen = false
+		closePanel()
+		Life.clearModuleToasts()
+	end
+end
 
 Life.connect(UserInputService.InputBegan, function(i, g)
-	if i.UserInputType ~= Enum.UserInputType.Keyboard then
+	if Config.restoring or i.UserInputType ~= Enum.UserInputType.Keyboard then
+		return
+	end
+	if i.KeyCode == Enum.KeyCode.F8 and not g and not binding and not UserInputService:GetFocusedTextBox() then
+		local clean = Modules["Clean HUD"]
+		setOn(clean, not clean.enabled, true)
 		return
 	end
 	if i.KeyCode == Enum.KeyCode.RightShift then
+		if Modules["Clean HUD"].enabled then return end
 		local show = not overlay.Visible
 		overlay.Visible = show
 		pcall(function()
@@ -8417,6 +8534,7 @@ end)
 
 refreshHud()
 Config.start()
+screen.Enabled = not Modules["Clean HUD"].enabled
 notify("Loaded. Right Shift opens the menu, right-click a module for settings.")
 end
 
