@@ -2720,7 +2720,10 @@ do
 	end
 	local function togglePrediction(on,m)
 		if on then
-			if not install(m) then notify(m.name .. ": waiting for the projectile controller") end
+			if not install(m) then
+				m.status = "Waiting for the projectile controller"
+				print("[Falcon] " .. m.name .. ": " .. m.status)
+			end
 		else
 			release()
 			local aura=Modules["Projectile Aura"]
