@@ -27,30 +27,8 @@ local cam = workspace.CurrentCamera
 local dbg = (type(debug) == "table" and debug) or {}
 
 local function parentGui()
-	local ok, hui = pcall(function()
-		return gethui()
-	end)
-	if ok and typeof(hui) == "Instance" then
-		return hui
-	end
-	local pg = lp and (lp:FindFirstChildOfClass("PlayerGui") or lp:FindFirstChild("PlayerGui"))
-	if pg then
-		return pg
-	end
-	if lp then
-		local waited = lp:WaitForChild("PlayerGui", 5)
-		if waited then
-			return waited
-		end
-	end
-	if syn and syn.protect_gui then
-		local ok2, core = pcall(function()
-			return game:GetService("CoreGui")
-		end)
-		if ok2 then
-			return core
-		end
-	end
+	if not lp then return end
+	return lp:FindFirstChildOfClass("PlayerGui") or lp:WaitForChild("PlayerGui", 10)
 end
 
 local function notify(text)
@@ -83,24 +61,15 @@ end
 Life.connect(workspace:GetPropertyChangedSignal("CurrentCamera"), function() cam = workspace.CurrentCamera end)
 
 local bootLabel
+local bootStage = "initialization"
 pcall(function()
-	local host
-	local ok, hui = pcall(gethui)
-	if ok and typeof(hui) == "Instance" then
-		host = hui
-	end
-	if not host and lp then
-		host = lp:FindFirstChildOfClass("PlayerGui") or lp:FindFirstChild("PlayerGui")
-	end
-	if not host then
-		host = game:GetService("CoreGui")
-	end
+	local host = lp and lp:FindFirstChildOfClass("PlayerGui")
+	if not host then return end
 	local g = Instance.new("ScreenGui")
 	g.Name = "EnvyV1Boot"
 	g.ResetOnSpawn = false
 	g.IgnoreGuiInset = true
 	g.DisplayOrder = 999999
-	g.Parent = host
 	local t = Instance.new("TextLabel")
 	t.Name = "Text"
 	t.BackgroundColor3 = Color3.new(0, 0, 0)
@@ -113,6 +82,7 @@ pcall(function()
 	t.Text = "Project Falcon loading"
 	t.Parent = g
 	bootLabel = g
+	g.Parent = host
 end)
 
 local function boot()
@@ -518,6 +488,7 @@ local function breakerKind(item)
 	end
 	if not id or id=="" then id=tool and tool.Name end
 	local name = string.lower(tostring(id or "")):gsub("[%s_%-]", "")
+	if name == "voidaxe" or name == "voidregentaxe" or name == "regentvoidaxe" then return end
 	if string.find(name, "pickaxe", 1, true) then return "stone" end
 	if string.find(name, "shear", 1, true) then return "wool" end
 	if string.find(name, "axe", 1, true) then return "wood" end
@@ -525,13 +496,13 @@ end
 
 local function breakerDamage(item,kind)
 	local toolKind=breakerKind(item)
-	if not toolKind or (kind=="wood" and toolKind~="wood") then return 0 end
+	if not toolKind then return 0 end
 	local meta=metaOf(item.itemType)
-	local damage=meta and meta.breakBlock and meta.breakBlock[kind]
+	local stats=meta and meta.breakBlock
+	local damage=type(stats)=="table" and stats[kind]
 	if type(damage)=="number" and damage>0 then return damage end
-	-- Wool can still be mined with an axe or pickaxe when shears are absent.
-	if toolKind==kind or (kind=="wool" and (toolKind=="wood" or toolKind=="stone")) then return 1 end
-	return 0
+	-- A mismatched mining tool can still deal base block damage.
+	return 1
 end
 
 local function holdingBreaker()
@@ -558,7 +529,7 @@ end
 local miningEquip={at=-math.huge}
 local function equipBreaker(kind)
 	local inv=inventory()
-	if not inv or not inv.items then return nil,false,"Inventory unavailable" end
+	if not inv then return nil,false,"Inventory unavailable" end
 	local hotbar=inv.hotbar
 	if not hotbar and BW.store then
 		local ok,state=pcall(function() return BW.store:getState() end)
@@ -566,15 +537,24 @@ local function equipBreaker(kind)
 	end
 	local best,bestDamage,bestSlot=nil,0,nil
 	local function consider(item,slot)
-		if type(item)~="table" or not breakerKind(item) then return end
-		if kind=="wood" and breakerKind(item)~="wood" then return end
+		if type(item)~="table" then return end
+		local toolKind=breakerKind(item)
+		if not toolKind then return end
 		local damage=breakerDamage(item,kind)
-		if damage>bestDamage or (damage>0 and damage==bestDamage and breakerKind(item)==kind and breakerKind(best)~=kind) then best,bestDamage,bestSlot=item,damage,slot
-		elseif best and item.itemType==best.itemType and slot~=nil then bestSlot=slot end
+		local bestKind=breakerKind(best)
+		local matchingAxe=kind=="wood" and toolKind=="wood"
+		local bestIsAxe=kind=="wood" and bestKind=="wood"
+		if (matchingAxe and not bestIsAxe) or (matchingAxe==bestIsAxe
+			and (damage>bestDamage or (damage==bestDamage and toolKind==kind and bestKind~=kind))) then
+			best,bestDamage,bestSlot=item,damage,slot
+		elseif best and item.itemType==best.itemType and slot~=nil then
+			bestSlot=slot
+		end
 	end
-	for _,item in pairs(inv.items) do consider(item) end
+	consider(inv.hand)
+	for _,item in pairs(inv.items or {}) do consider(item) end
 	for slot,entry in pairs(hotbar or {}) do consider(entry.item or entry,slot) end
-	if not best then return nil,false,kind=="wood" and "No axe in inventory" or "No suitable mining tool in inventory" end
+	if not best then return nil,false,"No mining tool in inventory" end
 	local model=char()
 	local ref=model and model:FindFirstChild("HandInvItem")
 	local hasRef=ref and ref:IsA("ObjectValue")
@@ -668,9 +648,10 @@ local function pick(range, o)
 	o = o or {}
 	local me = root()
 	if not me or healthOf(me.Parent) <= 0 then
-		return
+		return o.candidates and {} or nil
 	end
 	local best, bestRoot, bestScore, bestDist
+	local candidates = o.candidates and {}
 	for _, plr in ipairs(Players:GetPlayers()) do
 		local model = plr.Character
 		local r = model and (model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart)
@@ -696,11 +677,20 @@ local function pick(range, o)
 					local offset = r.Position - cam.CFrame.Position
 					score = offset.Magnitude > 0.001 and -cam.CFrame.LookVector:Dot(offset.Unit) or -1
 				end
-				if not bestScore or score < bestScore or (score == bestScore and d < bestDist) then
+				if candidates then
+					table.insert(candidates, {player = plr, root = r, score = score, distance = d})
+				elseif not bestScore or score < bestScore or (score == bestScore and d < bestDist) then
 					best, bestRoot, bestScore, bestDist = plr, r, score, d
 				end
 			end
 		end
+	end
+	if candidates then
+		table.sort(candidates, function(a, b)
+			if a.score == b.score then return a.distance < b.distance end
+			return a.score < b.score
+		end)
+		return candidates
 	end
 	return best, bestRoot, bestDist
 end
@@ -1654,6 +1644,15 @@ local function planBedRoute(bed,origin,range,currentRoute,autoTool)
 			end end
 		end
 	end
+	local function isDefense(part)
+		if not part:IsA("BasePart") then return false end
+		local blockType=part:GetAttribute("BlockType") or part:GetAttribute("blockType") or part.Name
+		local name=blockType:lower()
+		local meta=metaOf(blockType)
+		return meta and meta.block or name:find("wool",1,true) or name:find("stone",1,true)
+			or name:find("wood",1,true) or name:find("obsidian",1,true) or name:find("ceramic",1,true)
+			or name:find("clay",1,true) or name:find("glass",1,true) or name:find("plank",1,true)
+	end
 	local source="block-store"
 	local registered=false
 	if store then
@@ -1679,11 +1678,7 @@ local function planBedRoute(bed,origin,range,currentRoute,autoTool)
 			local cells={}
 			local function key(p) return p.X .. ":" .. p.Y .. ":" .. p.Z end
 			for _,part in ipairs(nearby) do
-				local name=part.Name:lower()
-				local meta=metaOf(part.Name)
-				if part:IsA("BasePart") and (meta and meta.block or name:find("wool",1,true) or name:find("stone",1,true)
-					or name:find("wood",1,true) or name:find("obsidian",1,true) or name:find("ceramic",1,true)
-					or name:find("clay",1,true) or name:find("glass",1,true) or name:find("plank",1,true)) then
+				if isDefense(part) then
 					if not done[part] then cells[key(snap3(part.Position))]=part end
 				end
 			end
@@ -1732,12 +1727,8 @@ local function planBedRoute(bed,origin,range,currentRoute,autoTool)
 						end
 					end
 					if wanted[id] and part:IsA("BasePart") and not done[part] then
-						local name=part.Name:lower()
-						local meta=metaOf(part.Name)
 						if part==bed or part:IsDescendantOf(bed) then updated[id]=target
-						elseif meta and meta.block or name:find("wool",1,true) or name:find("stone",1,true)
-							or name:find("wood",1,true) or name:find("obsidian",1,true) or name:find("ceramic",1,true)
-							or name:find("clay",1,true) or name:find("glass",1,true) or name:find("plank",1,true) then updated[id]=part end
+						elseif isDefense(part) then updated[id]=part end
 					end
 				end
 				for id in pairs(wanted) do cells[id]=updated[id] end
@@ -1745,8 +1736,62 @@ local function planBedRoute(bed,origin,range,currentRoute,autoTool)
 			source="geometry"
 		end
 	end
+	local normals={Vector3.new(1,0,0),Vector3.new(-1,0,0),Vector3.new(0,0,1),Vector3.new(0,0,-1),Vector3.yAxis,-Vector3.yAxis}
+	local planningInventory=inventory()
+	local tools={}
+	local function addTool(item)
+		if type(item)=="table" and breakerKind(item) then table.insert(tools,item) end
+	end
+	if autoTool~=false then
+		for _,item in pairs(planningInventory and planningInventory.items or {}) do addTool(item) end
+		local hotbar=planningInventory and planningInventory.hotbar
+		if not hotbar and BW.store then
+			pcall(function() hotbar=BW.store:getState().Inventory.observedInventory.hotbar end)
+		end
+		for _,entry in pairs(hotbar or {}) do addTool(entry.item or entry) end
+	end
+	local model=char()
+	local ref=model and model:FindFirstChild("HandInvItem")
+	local held=ref and ref:IsA("ObjectValue") and ref.Value or handTool()
+	if autoTool~=false or not held then addTool(planningInventory and planningInventory.hand) end
+	if held then addTool({itemType=held.Name,tool=held}) end
+	local costCache={}
+	local function blockCost(part,cell)
+		if costCache[part] then return costCache[part].hits,costCache[part].health end
+		if part:GetAttribute("NoBreak")==true then return math.huge,math.huge end
+		local blockType=part:GetAttribute("BlockType") or part:GetAttribute("blockType") or part.Name
+		local meta=metaOf(blockType)
+		local health=part:GetAttribute("Health") or part:GetAttribute("MaxHealth")
+		if cell and store and type(store.getBlockData)=="function" then
+			pcall(function()
+				local data=store:getBlockData(cell)
+				if data then health=data:GetAttribute("1") or data:GetAttribute("Health") or health end
+			end)
+		end
+		if type(health)~="number" or health~=health or health<=0 or health==math.huge then health=meta and meta.block and (meta.block.health or meta.block.maxHealth) end
+		local kind=breakKind(part)
+		local known=type(health)=="number" and health==health and health<math.huge and health>0
+		-- Estimates are explicitly marked when live health/metadata is absent.
+		-- Unknown obsidian must not look cheaper than known wool merely because
+		-- one route has replicated health and the other does not.
+		if not known then health=blockType:lower():find("obsidian",1,true) and 150 or kind=="wool" and 8 or kind=="wood" and 35 or 60 end
+		local previous=costs[part]
+		local remaining=health
+		if previous and health==previous.observed then remaining=math.min(health,previous.remaining) end
+		local damage,axeDamage=0,0
+		for _,item in ipairs(tools) do
+			local estimate=breakerDamage(item,kind)
+			damage=math.max(damage,estimate)
+			if kind=="wood" and breakerKind(item)=="wood" then axeDamage=math.max(axeDamage,estimate) end
+		end
+		if axeDamage>0 then damage=axeDamage end
+		local hits=damage>0 and math.max(1,math.ceil(remaining/damage)) or math.huge
+		costs[part]={observed=health,remaining=remaining,damage=damage,estimated=not known}
+		costCache[part]={hits=hits,health=remaining}
+		return hits,remaining
+	end
+	local remainingScore,remainingHealth=0,0
 	if store then
-		local normals={Vector3.new(1,0,0),Vector3.new(-1,0,0),Vector3.new(0,0,1),Vector3.new(0,0,-1),Vector3.yAxis,-Vector3.yAxis}
 		local function key(p) return p.X .. ":" .. p.Y .. ":" .. p.Z end
 		local cellCache={}
 		local function blockAt(cell)
@@ -1767,57 +1812,12 @@ local function planBedRoute(bed,origin,range,currentRoute,autoTool)
 		local function entryClear(point,node)
 			if (point-origin).Magnitude<0.1 then return true end
 			local hit=workspace:Raycast(origin,point-origin,params)
-			-- A ray ending past an exposed face can hit the target itself. That
-			-- proves access too; it is not an intervening defense block.
-			return not hit or hit.Instance==node.part or hit.Instance:IsDescendantOf(node.part)
+			if not hit or hit.Instance==node.part or hit.Instance:IsDescendantOf(node.part) then return true end
+			-- The center of an air cell can be occluded even when its adjoining face is visible.
+			local face=node.cell*3+(point-node.cell*3)*0.45
+			local faceHit=workspace:Raycast(origin,face-origin,params)
+			return faceHit and (faceHit.Instance==node.part or faceHit.Instance:IsDescendantOf(node.part))
 		end
-		local planningInventory=inventory()
-		local tools={}
-		local function addTool(item)
-			if type(item)=="table" and breakerKind(item) then table.insert(tools,item) end
-		end
-		if autoTool~=false then
-			for _,item in pairs(planningInventory and planningInventory.items or {}) do addTool(item) end
-			local hotbar=planningInventory and planningInventory.hotbar
-			if not hotbar and BW.store then
-				pcall(function() hotbar=BW.store:getState().Inventory.observedInventory.hotbar end)
-			end
-			for _,entry in pairs(hotbar or {}) do addTool(entry.item or entry) end
-		end
-		local model=char()
-		local ref=model and model:FindFirstChild("HandInvItem")
-		local held=ref and ref:IsA("ObjectValue") and ref.Value or handTool()
-		if held then addTool({itemType=held.Name,tool=held}) end
-		local costCache={}
-		local function blockCost(part,cell)
-			if costCache[part] then return costCache[part].hits,costCache[part].health end
-			if part:GetAttribute("NoBreak")==true then return math.huge,math.huge end
-			local meta=metaOf(part.Name)
-			local health=part:GetAttribute("Health") or part:GetAttribute("MaxHealth")
-			if type(store.getBlockData)=="function" then
-				pcall(function()
-					local data=store:getBlockData(cell)
-					if data then health=data:GetAttribute("1") or data:GetAttribute("Health") or health end
-				end)
-			end
-			if type(health)~="number" or health~=health then health=meta and meta.block and (meta.block.health or meta.block.maxHealth) end
-			local kind=breakKind(part)
-			local known=type(health)=="number" and health==health and health<math.huge and health>=0
-			-- Estimates are explicitly marked when live health/metadata is absent.
-			-- Unknown obsidian must not look cheaper than known wool merely because
-			-- one route has replicated health and the other does not.
-			if not known then health=part.Name:lower():find("obsidian",1,true) and 150 or kind=="wool" and 8 or kind=="wood" and 35 or 60 end
-			local previous=costs[part]
-			local remaining=health
-			if previous and health==previous.observed then remaining=math.min(health,previous.remaining) end
-			local damage=0
-			for _,item in ipairs(tools) do damage=math.max(damage,breakerDamage(item,kind)) end
-			local hits=damage>0 and math.max(1,math.ceil(remaining/damage)) or math.huge
-			costs[part]={observed=health,remaining=remaining,damage=damage,estimated=not known}
-			costCache[part]={hits=hits,health=remaining}
-			return hits,remaining
-		end
-		local remainingScore,remainingHealth=0,0
 		if currentRoute then
 			local counted={}
 			for _,step in ipairs(currentRoute.steps or {}) do
@@ -1894,11 +1894,7 @@ local function planBedRoute(bed,origin,range,currentRoute,autoTool)
 									health=node.health,score=node.cost,distance=distance}
 							end
 						elseif ok and block and block:IsA("BasePart") and not seenCells[key(cell)] and node.depth<8 and block:GetAttribute("NoBreak")~=true then
-							local name=block.Name:lower()
-							local meta=metaOf(block.Name)
-							local known=meta and meta.block or name:find("wool",1,true) or name:find("stone",1,true) or name:find("wood",1,true)
-								or name:find("obsidian",1,true) or name:find("ceramic",1,true) or name:find("clay",1,true) or name:find("glass",1,true) or name:find("plank",1,true)
-							if known then
+							if isDefense(block) then
 								local hits,hp=blockCost(block,cell)
 								local cost=node.cost+hits
 								local id=key(cell)..":"..(node.depth+1)
@@ -1920,33 +1916,58 @@ local function planBedRoute(bed,origin,range,currentRoute,autoTool)
 		end
 		if currentRoute then return nil,remainingScore,remainingHealth end
 	end
-	-- Without a usable store, trace a single fixed line into the bed.
-	-- Each collected block must actually occlude that line.
-	local targetPart=bed:IsA("BasePart") and bed or bed.PrimaryPart or parts[1]
-	if not targetPart then return end
+	-- Trace each external face when no grid route is available.
 	local params=RaycastParams.new()
 	params.FilterType=Enum.RaycastFilterType.Exclude
 	params.RespectCanCollide=true
-	local ignore,route,seen={},{},{}
+	local ignore={}
 	for _,player in ipairs(Players:GetPlayers()) do if player.Character then table.insert(ignore,player.Character) end end
-	for _=1,16 do
-		params.FilterDescendantsInstances=ignore
-		local hit=workspace:Raycast(origin,targetPart.Position-origin,params)
-		if not hit or hit.Instance==bed or hit.Instance:IsDescendantOf(bed) then
-			table.insert(route,{part=targetPart,position=hit and hit.Position or targetPart.Position,normal=hit and hit.Normal or Vector3.yAxis,toolKind="wood"})
-			return {bed=bed,steps=route,index=1,done={},entry=origin,source="single-ray"}
+	if currentRoute then
+		for _,step in ipairs(currentRoute.steps) do
+			local part=step.part
+			if part.Parent and not done[part] and part~=bed and not part:IsDescendantOf(bed) then
+				local hits,hp=blockCost(part,step.cell)
+				remainingScore+=hits;remainingHealth+=hp
+			end
 		end
-		local block=hit.Instance
-		if seen[block] or not block:IsA("BasePart") or block:GetAttribute("NoBreak")==true then return end
-		local meta=metaOf(block.Name)
-		local name=block.Name:lower()
-		if not (meta and meta.block or name:find("wool",1,true) or name:find("stone",1,true)
-			or name:find("wood",1,true) or name:find("obsidian",1,true) or name:find("ceramic",1,true)
-			or name:find("clay",1,true) or name:find("glass",1,true) or name:find("plank",1,true)) then return end
-		seen[block]=true
-		table.insert(route,{part=block,position=hit.Position,normal=hit.Normal})
-		table.insert(ignore,block)
 	end
+	local winner
+	for _,rootCell in ipairs(bedCells) do
+		for _,normal in ipairs(normals) do
+			local face=rootCell.cell*3+normal*1.45
+			local direction=face-origin
+			local distance=direction.Magnitude
+			local entry=rootCell.cell+normal
+			local entryKey=entry.X .. ":" .. entry.Y .. ":" .. entry.Z
+			if distance<=range and not seenCells[entryKey] and direction:Dot(normal)<0 then
+				local excluded,steps,score,health=table.clone(ignore),{},0,0
+				for _=1,16 do
+					params.FilterDescendantsInstances=excluded
+					local hit=workspace:Raycast(origin,direction,params)
+					if not hit or hit.Instance==bed or hit.Instance:IsDescendantOf(bed) then
+						if (not currentRoute or score<remainingScore) and (not winner or score<winner.score
+							or (score==winner.score and (health<winner.health or (health==winner.health and distance<winner.distance)))) then
+							table.insert(steps,{part=rootCell.part,cell=rootCell.cell,position=hit and hit.Position or face,
+								normal=hit and hit.Normal or normal,toolKind="wood"})
+							winner={bed=bed,steps=steps,index=1,done=done,costs=costs,entry=origin,source="face-rays",
+								score=score,health=health,distance=distance,bedCellCount=#bedCells}
+						end
+						break
+					end
+					local block=hit.Instance
+					if not isDefense(block) then break end
+					if not done[block] then
+						local hits,hp=blockCost(block,snap3(block.Position))
+						score+=hits;health+=hp
+						if score==math.huge or (winner and score>winner.score) or (currentRoute and score>=remainingScore) then break end
+						table.insert(steps,{part=block,position=hit.Position,normal=hit.Normal})
+					end
+					table.insert(excluded,block)
+				end
+			end
+		end
+	end
+	return winner,remainingScore,remainingHealth
 end
 
 local function routeDistance(route,position)
@@ -2459,7 +2480,7 @@ do
 	local pressedByAura, releaseMouse, projectileMeta
 	local motion=setmetatable({}, {__mode="k"})
 	local function sampleMotion(previous,position,velocity,now)
-		local sample={position=position,velocity=velocity,at=now}
+		local sample={position=position,velocity=velocity,reported=velocity,at=now}
 		if previous then
 			local dt=now-previous.at
 			local displacement=position-previous.position
@@ -2492,8 +2513,13 @@ do
 			local root=character and character:FindFirstChild("HumanoidRootPart")
 			if player~=lp and root then
 				local previous=motion[root]
-				if not previous or now-previous.at>=0.08 then
-					motion[root]=sampleMotion(previous,root.Position,root.AssemblyLinearVelocity,now)
+				if not previous or now - previous.at >= 0.08 then
+					local position, velocity = root.Position, root.AssemblyLinearVelocity
+					if not previous or now - previous.at >= 0.18
+						or (position - previous.position).Magnitude > 0.02
+						or (velocity - previous.reported).Magnitude > 3 then
+						motion[root] = sampleMotion(previous, position, velocity, now)
+					end
 				end
 			end
 		end
@@ -2515,7 +2541,7 @@ do
 		if floorY then point = Vector3.new(point.X, math.max(point.Y, floorY), point.Z) end
 		return point
 	end
-	local function solve(origin, speed, gravity, target, velocity, maximum, targetGravity, floorY, lead)
+	local function solve(origin, speed, gravity, target, velocity, maximum, targetGravity, floorY, lead, accept)
 		-- Find the earliest positive intercept under constant projectile gravity.
 		local function aimAt(t)
 			return predictedPoint(target, velocity, t + (lead or 0), targetGravity, floorY) - origin + Vector3.new(0, gravity * t * t * 0.5, 0)
@@ -2528,15 +2554,19 @@ do
 		for i = 1, 160 do
 			local high = maximum * (i / 160) ^ 2
 			local value = residual(high)
-			if value <= 0 and previous >= 0 then
+			if (previous >= 0 and value < 0) or (accept and previous < 0 and value >= 0) then
+				local fromOutside = previous >= 0
+				local left, right = low, high
 				for _ = 1, 20 do
-					local mid = (low + high) * 0.5
-					if residual(mid) > 0 then low = mid else high = mid end
+					local mid = (left + right) * 0.5
+					if (residual(mid) > 0) == fromOutside then left = mid else right = mid end
 				end
-				local t = (low + high) * 0.5
+				local t = (left + right) * 0.5
 				local required = aimAt(t) / t
-				if required.Magnitude > 0.001 then return required.Unit * speed, t end
-				return
+				if required.Magnitude > 0.001 then
+					local launch = required.Unit * speed
+					if not accept or accept(launch, t) then return launch, t end
+				end
 			end
 			low, previous = high, value
 		end
@@ -2552,7 +2582,10 @@ do
 			local t = duration * i / segments
 			local point = origin + velocity * t - Vector3.new(0, gravity * t * t * 0.5, 0)
 			local hit = workspace:Raycast(previous, point - previous, params)
-			if hit then return hit.Instance:IsDescendantOf(target) end
+			if hit then
+				local ok, part = pcall(function() return hit.Instance end)
+				return ok and part ~= nil and part:IsDescendantOf(target)
+			end
 			previous = point
 		end
 		return true
@@ -2600,11 +2633,10 @@ do
 				m.status="Selected projectile is not an arrow, fireball, or snowball"
 				return table.unpack(results, 1, results.n)
 			end
-			-- The curved flight path below determines whether the shot is clear.
-			local target, r = pick(get(m, "Range"), { screen = get(m,"Full screen"), fov = get(m, "FOV"), visible = false, sort = "Angle" })
-			if not target or not r then
-				m.status="No enemy inside projectile range and FOV"
-				return table.unpack(results,1,results.n)
+			local candidates = pick(get(m, "Range"), {screen = get(m, "Full screen"), fov = get(m, "FOV"), sort = "Angle", candidates = true})
+			if #candidates == 0 then
+				m.status = "No enemy inside projectile range and FOV"
+				return table.unpack(results, 1, results.n)
 			end
 			local speed = values.initialVelocity.Magnitude
 			if get(m,"Speed override")>0 then speed=get(m,"Speed override") end
@@ -2617,41 +2649,50 @@ do
 				return table.unpack(results, 1, results.n)
 			end
 			gravity = math.abs(gravity)
-			local sample=motion[r]
-			if sample and os.clock()-sample.at>0.3 then sample=nil end
-			local targetVelocity = get(m, "Prediction") and (sample and sample.velocity or r.AssemblyLinearVelocity) or Vector3.zero
-			local targetGravity, floorY = 0, nil
-			local humanoid = target.Character:FindFirstChildOfClass("Humanoid")
-			if get(m, "Prediction") and humanoid then
-				if humanoid.FloorMaterial ~= Enum.Material.Air then
-					targetVelocity = Vector3.new(targetVelocity.X, 0, targetVelocity.Z)
-				else
-					local state = humanoid:GetState()
-					if state == Enum.HumanoidStateType.Jumping or state == Enum.HumanoidStateType.Freefall then
-						targetGravity = movementGravity(sample,workspace.Gravity)
+			local maximum = get(m, "Max flight")
+			if info and type(info.lifetimeSec) == "number" then maximum = math.min(maximum, info.lifetimeSec) end
+			local velocity
+			for index = 1, math.min(#candidates, 4) do
+				local candidate = candidates[index]
+				local r, character = candidate.root, candidate.root.Parent
+				local sample = motion[r]
+				local liveVelocity = r.AssemblyLinearVelocity
+				if sample and (os.clock() - sample.at > 0.18
+					or (liveVelocity - sample.reported).Magnitude > 10) then sample = nil end
+				local targetVelocity = get(m, "Prediction") and (sample and sample.velocity or liveVelocity) or Vector3.zero
+				local targetGravity, floorY = 0, nil
+				local humanoid = character:FindFirstChildOfClass("Humanoid")
+				if get(m, "Prediction") and humanoid then
+					if humanoid.FloorMaterial ~= Enum.Material.Air then
+						targetVelocity = Vector3.new(targetVelocity.X, 0, targetVelocity.Z)
+					else
+						local state = humanoid:GetState()
+						if state == Enum.HumanoidStateType.Jumping or state == Enum.HumanoidStateType.Freefall then
+							targetGravity = movementGravity(sample,workspace.Gravity)
+						end
 					end
 				end
+				local point = r.Position
+				if get(m, "Aim at") == "Head" then
+					local head = character:FindFirstChild("Head")
+					if head and head:IsA("BasePart") then point = head.Position end
+				end
+				-- Additional lead is user-controlled; flight time is solved separately.
+				local lead = get(m, "Extra lead") / 1000
+				if targetGravity > 0 then
+					local params = RaycastParams.new()
+					params.FilterType = Enum.RaycastFilterType.Exclude
+					params.FilterDescendantsInstances = {char(), character}
+					params.RespectCanCollide = true
+					local ground = workspace:Raycast(r.Position, Vector3.new(0,-256,0),params)
+					if ground then floorY = ground.Position.Y + humanoid.HipHeight + r.Size.Y * 0.5 + (point.Y-r.Position.Y) end
+				end
+				velocity = solve(values.positionFrom, speed, gravity, point, targetVelocity, maximum, targetGravity, floorY, lead, function(launch, flight)
+					return clearPath(values.positionFrom, launch, gravity, flight, character)
+				end)
+				if velocity then break end
 			end
-			local point = r.Position
-			if get(m, "Aim at") == "Head" then
-				local head = target.Character:FindFirstChild("Head")
-				if head and head:IsA("BasePart") then point = head.Position end
-			end
-			-- Additional lead is user-controlled; flight time is solved separately.
-			local lead = get(m, "Extra lead") / 1000
-			if targetGravity > 0 then
-				local params = RaycastParams.new()
-				params.FilterType = Enum.RaycastFilterType.Exclude
-				params.FilterDescendantsInstances = {char(), target.Character}
-				params.RespectCanCollide = true
-				local ground = workspace:Raycast(r.Position, Vector3.new(0,-256,0),params)
-				if ground then floorY = ground.Position.Y + humanoid.HipHeight + r.Size.Y * 0.5 + (point.Y-r.Position.Y) end
-			end
-			local maximum=get(m,"Max flight")
-			if info and type(info.lifetimeSec)=="number" then maximum=math.min(maximum,info.lifetimeSec) end
-			-- Recalculate previews and released shots from the latest movement.
-			local velocity, flight=solve(values.positionFrom,speed,gravity,point,targetVelocity,maximum,targetGravity,floorY,lead)
-			if not velocity or not clearPath(values.positionFrom, velocity, gravity, flight, target.Character) then
+			if not velocity then
 				m.status = "No clear intercept"
 				return table.unpack(results, 1, results.n)
 			end
@@ -2731,8 +2772,9 @@ do
 		if not ok and tool:IsA("Tool") then ok=pcall(function() tool:Activate() end) end
 		if not ok then m.status="Input activation unavailable; fire manually";release();return end
 		m.status="Charging equipped projectile"
+		local scheduledShot = m.nextShot
 		task.delay(get(m, "Charge") / 1000, function()
-			if charging == tool then release() end
+			if charging == tool and m.nextShot == scheduledShot then release() end
 		end)
 	end, 0.1)
 end
@@ -3131,6 +3173,244 @@ do
 		end
 		m.status = feathers .. " feathers | " .. speed .. " studs/s | " .. source
 	end, 0)
+end
+
+do
+	local cast, nextCast
+	local function inventoryState()
+		local ok, state = pcall(function() return BW.store:getState().Inventory.observedInventory end)
+		return ok and state or nil
+	end
+	local function restoreSlot()
+		local prior = cast
+		cast = nil
+		if not prior or char() ~= prior.character or prior.previous == prior.slot then return end
+		local state = inventoryState()
+		if state and state.hotbarSlot == prior.slot then equipSlot(prior.previous) end
+	end
+	local function pullable(body, player, range)
+		local model = player.Character
+		local target = model and (model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart)
+		if player == lp or not enemy(player) or not target or not target:IsDescendantOf(workspace)
+			or healthOf(model) <= 0 or model:FindFirstChildOfClass("ForceField") then return end
+		local delta = target.Position - body.Position
+		if delta.Magnitude > range or delta.Magnitude < 0.1 then return end
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		local ignore = {body.Parent, model}
+		if workspace.CurrentCamera then table.insert(ignore, workspace.CurrentCamera) end
+		params.FilterDescendantsInstances = ignore
+		params.RespectCanCollide = true
+		if not workspace:Raycast(body.Position, delta, params) then return target end
+	end
+	local function bestPullable(body, range, priority)
+		local best, bestPart, distance, health = nil, nil, math.huge, math.huge
+		for _, player in ipairs(Players:GetPlayers()) do
+			local target = pullable(body, player, range)
+			if target then
+				local d, hp = (target.Position - body.Position).Magnitude, healthOf(player.Character)
+				if (priority == "Nearest" and d < distance)
+					or (priority ~= "Nearest" and (hp < health or (hp == health and d < distance))) then
+					best, bestPart, distance, health = player, target, d, hp
+				end
+			end
+		end
+		return best, bestPart
+	end
+
+	local function diagnose(m)
+		if m.diagnosed then return end
+		local lines = {"[Falcon Auto Lassy] BEGIN controller diagnostic"}
+		local found = false
+		local function describe(name, object)
+			if type(object) ~= "table" then return end
+			found = true
+			local methods, seen = {}, {}
+			local function inspect(t)
+				if type(t) ~= "table" then return end
+				for key, fn in pairs(t) do
+					if type(fn) == "function" and not seen[key] then
+						seen[key] = true
+						methods[#methods + 1] = {name = tostring(key), fn = fn}
+					end
+				end
+			end
+			inspect(object)
+			local mt = getmetatable(object)
+			if type(mt) == "table" then inspect(mt.__index) end
+			table.sort(methods, function(x, y) return x.name < y.name end)
+			lines[#lines + 1] = "Controller: " .. name
+			for _, method in ipairs(methods) do
+				local detail = "  " .. method.name
+				if type(dbg.info) == "function" then
+					local ok, count = pcall(dbg.info, method.fn, "a")
+					if ok and type(count) == "number" then detail ..= " (parameters=" .. count .. ")" end
+				end
+				lines[#lines + 1] = detail
+				local visited = {}
+				local function constants(fn, depth)
+					if type(fn) ~= "function" or visited[fn] or depth > 2 then return end
+					visited[fn] = true
+					if type(dbg.getconstants) == "function" then
+						local ok, values = pcall(dbg.getconstants, fn)
+						if ok and type(values) == "table" then
+							local names = {}
+							for _, value in ipairs(values) do
+								-- Only identifier-shaped constants: no runtime values or player data.
+								if type(value) == "string" and #value <= 80 and value:match("^[%a_][%w_%-%.]*$") then
+									names[#names + 1] = value
+								end
+							end
+							if #names > 0 then lines[#lines + 1] = "    identifiers: " .. table.concat(names, ", ") end
+						end
+					end
+					if depth < 2 and type(dbg.getprotos) == "function" then
+						local ok, protos = pcall(dbg.getprotos, fn)
+						if ok and type(protos) == "table" then for _, proto in pairs(protos) do constants(proto, depth + 1) end end
+					end
+				end
+				constants(method.fn, 0)
+			end
+		end
+		local controllers = BW.knit and BW.knit.Controllers
+		if type(controllers) == "table" then
+			for name, controller in pairs(controllers) do
+				local key = tostring(name):lower()
+				if key:find("lass", 1, true) or key:find("cowboy", 1, true) then describe(tostring(name), controller) end
+			end
+		end
+		if not found then
+			lines[#lines + 1] = "No Lasso/Lassy controller found in Knit.Controllers."
+			-- Locate the real module without requiring or executing unknown modules.
+			local scripts = lp:FindFirstChild("PlayerScripts")
+			if scripts then
+				for _, object in ipairs(scripts:GetDescendants()) do
+					local name = object.Name:lower()
+					if object:IsA("ModuleScript") and (name:find("lass", 1, true) or name:find("cowboy", 1, true)) then
+						lines[#lines + 1] = "Module: " .. object:GetFullName()
+					end
+				end
+			end
+		end
+		lines[#lines + 1] = "[Falcon Auto Lassy] END controller diagnostic"
+		for _, line in ipairs(lines) do print(line) end
+		m.diagnosed = true
+	end
+	table.insert(Life.cleanups, restoreSlot)
+	local lassy = add("Kits", "Auto Lassy", "Throw integration unavailable: tap Cast key to inspect a reachable target and print F9 diagnostics", function(m)
+		opt(m, "Cast key", "bind", Enum.KeyCode.V)
+		opt(m, "Range", "slider", 30, {min = 5, max = 50, suffix = " st"})
+		opt(m, "Priority", "list", "Lowest health", {list = {"Lowest health", "Nearest"}})
+	end, function(on, m)
+		m.requested, m.diagnosed = false, false
+		if not on then restoreSlot() else m.status = "Needs lasso integration · tap Cast key for F9 details" end
+	end, function(m)
+		local now = os.clock()
+		if not cast then
+			if not m.requested then return end
+			m.requested = false
+			if nextCast and now < nextCast then
+				m.status = string.format("Lasso cooldown · %.1f s", nextCast - now)
+				return
+			end
+		end
+		if menuOpen or UserInputService:GetFocusedTextBox() then restoreSlot(); return end
+		if UserInputService:IsMouseButtonPressed(M1) then restoreSlot(); m.status = "Release attack before casting"; return end
+		local body, character = root(), char()
+		if not character or not body or healthOf(character) <= 0 then restoreSlot(); return end
+		local target, aimPart
+		local range = cast and cast.range or get(m, "Range")
+		if cast then
+			target = cast.target
+			if cast.character == character and cast.targetCharacter == target.Character then
+				aimPart = pullable(body, target, range)
+			end
+		else
+			target, aimPart = bestPullable(body, range, get(m, "Priority"))
+		end
+		if not aimPart then
+			restoreSlot()
+			m.status = "No pullable enemy in range"
+			return
+		end
+		local state = inventoryState()
+		local inv = state and state.inventory
+		local hotbar = state and (state.hotbar or (inv and inv.hotbar))
+		if not hotbar or type(state.hotbarSlot) ~= "number" then
+			restoreSlot()
+			m.status = "Waiting for hotbar"
+			return
+		end
+		if not cast then
+			local slot
+			for index, entry in pairs(hotbar) do
+				local item = type(entry) == "table" and (entry.item or entry)
+				if type(index) == "number" and item and item.itemType == "lasso" and (item.amount or 1) > 0 then
+					slot = hotbar[0] ~= nil and index or index - 1
+					break
+				end
+			end
+			if slot == nil then m.status = "Put a lasso in your hotbar"; return end
+			cast = {
+				character = character,
+				target = target,
+				targetCharacter = target.Character,
+				range = range,
+				previous = state.hotbarSlot,
+				slot = slot,
+				timeout = now + 1.25,
+			}
+			if slot ~= state.hotbarSlot then
+				equipSlot(slot)
+				m.status = "Equipping lasso"
+				return
+			end
+		end
+		if state.hotbarSlot ~= cast.slot or not inv or not inv.hand or inv.hand.itemType ~= "lasso" then
+			cast.equippedAt = nil
+			if now >= cast.timeout or (state.hotbarSlot ~= cast.previous and state.hotbarSlot ~= cast.slot) then
+				restoreSlot()
+				nextCast = now + 0.65
+				m.status = "Lasso equip was interrupted"
+			end
+			return
+		end
+		local tool = inv.hand.tool
+		if typeof(tool) ~= "Instance" then
+			cast.equippedAt = nil
+			if now >= cast.timeout then restoreSlot(); m.status = "Waiting for lasso tool" end
+			return
+		end
+		if cast.tool ~= tool or not cast.equippedAt then
+			cast.tool, cast.equippedAt = tool, now
+		end
+		if now >= cast.timeout and now - cast.equippedAt < 0.1 then
+			restoreSlot()
+			m.status = "Lasso tool did not settle"
+			return
+		end
+		if now - cast.equippedAt < 0.1 then return end
+		if tool:IsA("Tool") and not tool.Enabled then
+			restoreSlot()
+			nextCast = now + 0.65
+			m.status = "Lasso is on cooldown"
+			return
+		end
+		-- Do not guess the throw API or hook shared camera/mouse methods.
+		-- Report actual controller methods so a supported adapter can be implemented.
+		local ok, err = pcall(diagnose, m)
+		restoreSlot()
+		nextCast = now + 0.65
+		if ok then
+			m.status = "Throw unavailable · copy Falcon Auto Lassy details from F9"
+		else
+			m.status = "Diagnostic failed · check F9 and retry"
+			warn("[Falcon Auto Lassy] Diagnostic failed: " .. tostring(err))
+		end
+	end, 0.05)
+	function lassy.requestCast()
+		if lassy.enabled and not cast and not menuOpen and not UserInputService:GetFocusedTextBox() then lassy.requested = true end
+	end
 end
 
 do
@@ -3782,6 +4062,112 @@ do
 	end, 0.08)
 	-- Populate lists before saved options are validated.
 	Life.indexItemSkins = function() indexSkins(changer) end
+end
+
+do
+	local markers = {}
+	local beeTags = {"bee", "Bee", "beekeeper-bee"}
+	local function isBee(object)
+		local name = object.Name:lower():gsub("[^%w]", "")
+		if name == "bee" or name == "beekeeperbee" then return true end
+		for _, tag in ipairs(beeTags) do
+			if CollectionService:HasTag(object, tag) then return true end
+		end
+		return false
+	end
+	local function beeObject(object)
+		local bee
+		while object and object ~= workspace do
+			if object:IsA("Tool") or object:IsA("Camera")
+				or (object:IsA("Model") and object:FindFirstChildOfClass("Humanoid")) then return end
+			if (object:IsA("BasePart") or object:IsA("Model")) and isBee(object) then bee = object end
+			object = object.Parent
+		end
+		return bee
+	end
+	local function remove(object)
+		markers[object].gui:Destroy()
+		markers[object] = nil
+	end
+	local function clear()
+		for object in pairs(markers) do remove(object) end
+	end
+	local function mark(object, m)
+		local bee = beeObject(object)
+		if not bee or markers[bee] then return end
+		local part = bee:IsA("BasePart") and bee or bee.PrimaryPart or bee:FindFirstChildWhichIsA("BasePart", true)
+		if not part then return end
+		-- A tagged model and its named mesh represent one collectible.
+		for existing in pairs(markers) do
+			if existing:IsDescendantOf(bee) then remove(existing) end
+		end
+		local gui = Instance.new("BillboardGui")
+		gui.Name = "FalconBeeIcon"
+		gui.Adornee = part
+		gui.StudsOffsetWorldSpace = Vector3.new(0, 1.4, 0)
+		gui.Size = UDim2.fromOffset(get(m, "Icon size"), get(m, "Icon size"))
+		gui.MaxDistance = get(m, "Range")
+		gui.AlwaysOnTop = get(m, "Through walls")
+		gui.Parent = part
+		local icon = Instance.new("ImageLabel")
+		icon.BackgroundTransparency = 1
+		icon.Size = UDim2.fromScale(1, 1)
+		icon.ScaleType = Enum.ScaleType.Fit
+		icon.Parent = gui
+		local glyph = Instance.new("TextLabel")
+		glyph.BackgroundTransparency = 1
+		glyph.Size = UDim2.fromScale(1, 1)
+		glyph.TextScaled = true
+		glyph.Font = Enum.Font.GothamBold
+		glyph.TextColor3 = Color3.fromRGB(255, 213, 64)
+		glyph.TextStrokeTransparency = 0.25
+		glyph.Text = "🐝"
+		glyph.Parent = gui
+		markers[bee] = {gui = gui, part = part, icon = icon, glyph = glyph}
+	end
+	table.insert(Life.cleanups, clear)
+	add("Kits", "Beekeeper ESP", "Show a bee icon above world bees", function(m)
+		opt(m, "Icon size", "slider", 28, {min = 14, max = 48, suffix = " px"})
+		opt(m, "Range", "slider", 600, {min = 50, max = 1500, step = 50, suffix = " st"})
+		opt(m, "Through walls", "toggle", true)
+	end, function(on, m)
+		if not on then clear(); return end
+		table.insert(m.conns, workspace.DescendantAdded:Connect(function(object)
+			if not (object:IsA("BasePart") or object:IsA("Model")) then return end
+			task.defer(function()
+				if m.enabled and Life.active and object:IsDescendantOf(workspace) then mark(object, m) end
+			end)
+		end))
+		for _, object in ipairs(workspace:GetDescendants()) do
+			if object:IsA("BasePart") or object:IsA("Model") then mark(object, m) end
+		end
+	end, function(m)
+		-- Tags may arrive after a bee is parented into the world.
+		for _, tag in ipairs(beeTags) do
+			for _, object in ipairs(CollectionService:GetTagged(tag)) do
+				if object:IsDescendantOf(workspace) then mark(object, m) end
+			end
+		end
+		local meta = metaOf("bee")
+		local asset = meta and meta.image
+		if type(asset) == "number" then asset = "rbxassetid://" .. asset end
+		local image = type(asset) == "string" and asset or ""
+		local size, count = get(m, "Icon size"), 0
+		for object, marker in pairs(markers) do
+			if not marker.part:IsDescendantOf(workspace) or beeObject(marker.part) ~= object then
+				remove(object)
+				if object:IsDescendantOf(workspace) then mark(object, m) end
+			else
+				marker.gui.Size = UDim2.fromOffset(size, size)
+				marker.gui.MaxDistance = get(m, "Range")
+				marker.gui.AlwaysOnTop = get(m, "Through walls")
+				marker.icon.Image = image
+				marker.glyph.Visible = image == "" or not marker.icon.IsLoaded
+				count += 1
+			end
+		end
+		m.status = count == 1 and "1 bee tracked" or count .. " bees tracked"
+	end, 0.2)
 end
 
 do
@@ -6864,7 +7250,7 @@ do
 	end, 0.04)
 end
 
-add("World", "Nuker", "Fast-breaks bed defense, then the bed", function(m)
+add("World", "Nuker", "Targets exposed beds or mines the cheapest reachable defense route", function(m)
 	opt(m, "Range", "slider", 25, { min = 10, max = 30, suffix = " st" })
 	opt(m, "Auto tool", "toggle", true)
 	opt(m, "Limit to items", "toggle", true)
@@ -7343,11 +7729,6 @@ end
 
 local function glass(inst)
 	pcall(function()
-		local b = Instance.new("UIBlur")
-		b.Size = 18
-		b.Parent = inst
-	end)
-	pcall(function()
 		local g = Instance.new("UIGradient")
 		g.Color = ColorSequence.new(Color3.fromRGB(255, 255, 255), Color3.fromRGB(218, 218, 218))
 		g.Transparency = NumberSequence.new({
@@ -7374,29 +7755,20 @@ local function stroke(p, a)
 end
 
 local function buildGui()
+bootStage = "finding PlayerGui"
+local host = parentGui()
+assert(host, "PlayerGui did not load within 10 seconds")
 pcall(function()
-	local function sweep(root)
-		if not root then
-			return
+	for _, child in ipairs(host:GetChildren()) do
+		if child ~= bootLabel and child:IsA("ScreenGui")
+			and (child.Name == "Falcon" or child.Name == "FalconNotifications" or child.Name == "Envy v1"
+				or child.Name == "EnvyV1Boot" or child.Name == "Quantumware" or child.Name == "QuantumwareBoot") then
+			child:Destroy()
 		end
-		for _, child in ipairs(root:GetChildren()) do
-			if child:IsA("ScreenGui") and (child.Name == "Falcon" or child.Name == "Envy v1" or child.Name == "EnvyV1Boot" or child.Name == "Quantumware" or child.Name == "QuantumwareBoot") then
-				child:Destroy()
-			end
-		end
-	end
-	if type(gethui) == "function" then
-		sweep(gethui())
-	end
-	sweep(game:GetService("CoreGui"))
-	if lp then
-		sweep(lp:FindFirstChildOfClass("PlayerGui"))
-	end
-	local oldSign = workspace:FindFirstChild("QW_Sign")
-	if oldSign then
-		oldSign:Destroy()
 	end
 end)
+
+bootStage = "creating the menu"
 local screen = Instance.new("ScreenGui")
 screen.Name = "Falcon"
 screen.ResetOnSpawn = false
@@ -7405,22 +7777,7 @@ screen.DisplayOrder = 999999
 screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 screen.Enabled = false
 table.insert(Life.resources,screen)
-pcall(function()
-	if syn and syn.protect_gui then
-		syn.protect_gui(screen)
-	end
-end)
-local attached = false
-pcall(function()
-	screen.Parent = parentGui()
-	attached = screen.Parent ~= nil
-end)
-if not attached and lp then
-	pcall(function()
-		screen.Parent = lp:WaitForChild("PlayerGui", 5)
-		attached = screen.Parent ~= nil
-	end)
-end
+screen.Parent = host
 
 local overlay = Instance.new("Frame")
 overlay.Size = UDim2.fromScale(1, 1)
@@ -7438,8 +7795,8 @@ notificationScreen.IgnoreGuiInset = true
 notificationScreen.DisplayOrder = screen.DisplayOrder + 1
 notificationScreen.Enabled = true
 notificationScreen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-notificationScreen.Parent = screen.Parent
 table.insert(Life.resources, notificationScreen)
+notificationScreen.Parent = host
 local toasts = Instance.new("Frame")
 toasts.Name = "Toasts"
 toasts.BackgroundTransparency = 1
@@ -8458,6 +8815,11 @@ Life.connect(UserInputService.InputBegan, function(i, g)
 	if g then
 		return
 	end
+	local lassy = Modules["Auto Lassy"]
+	if lassy.enabled and i.KeyCode == get(lassy, "Cast key") then
+		lassy.requestCast()
+		return
+	end
 	for _, m in pairs(Modules) do
 		local b = m.options.Bind
 		if b and b.value == i.KeyCode then
@@ -8532,8 +8894,10 @@ Life.connect(lp.CharacterAdded, function()
 	savedSpeed = nil
 end)
 
+bootStage = "restoring the profile"
 refreshHud()
 Config.start()
+bootStage = "opening the menu"
 screen.Enabled = not Modules["Clean HUD"].enabled
 notify("Loaded. Right Shift opens the menu, right-click a module for settings.")
 end
@@ -8546,7 +8910,9 @@ end
 end
 
 local okBoot, errBoot = xpcall(boot, function(err)
-	return tostring(err)
+	local message = bootStage .. ": " .. tostring(err)
+	local ok, trace = pcall(function() return debug.traceback(message, 2) end)
+	return {message = message, trace = ok and trace or message}
 end)
 if not okBoot then
 	if type(Life.Destroy)=="function" then
@@ -8557,12 +8923,12 @@ if not okBoot then
 		for _,obj in ipairs(Life.resources) do pcall(function() obj:Destroy() end) end
 		if Life.environment.EnvyV1Runtime==Life then Life.environment.EnvyV1Runtime=nil end
 	end
-	warn("[Falcon] " .. tostring(errBoot))
-	notify(tostring(errBoot))
+	warn("[Falcon] " .. errBoot.trace)
+	notify(errBoot.message)
 	pcall(function()
 		local t = bootLabel and bootLabel:FindFirstChild("Text")
 		if t then
-			t.Text = "Falcon error: " .. tostring(errBoot)
+			t.Text = "Falcon error: " .. errBoot.message
 			t.TextWrapped = true
 			t.Size = UDim2.fromOffset(480, 64)
 		end
