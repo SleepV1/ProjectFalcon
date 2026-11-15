@@ -367,6 +367,22 @@ local function handTool()
 	return c and c:FindFirstChildOfClass("Tool")
 end
 
+function Life.liveHandTool()
+	local model = char()
+	local ref = model and model:FindFirstChild("HandInvItem")
+	if ref and ref:IsA("ObjectValue") and ref.Value then
+		return ref.Value
+	end
+	return model and model:FindFirstChildOfClass("Tool")
+end
+
+function Life.isPearl(item)
+	if typeof(item) == "Instance" then
+		return Life.isPearl(item.Name) or Life.isPearl(item:GetAttribute("itemType")) or Life.isPearl(item:GetAttribute("ItemType"))
+	end
+	return type(item) == "string" and item:lower():find("pearl", 1, true) ~= nil
+end
+
 local function healthOf(model)
 	if not model then
 		return 0
@@ -423,7 +439,8 @@ local function inventory()
 		return BW.store:getState()
 	end)
 	if ok and state and state.Inventory and state.Inventory.observedInventory then
-		return state.Inventory.observedInventory.inventory
+		local observed = state.Inventory.observedInventory
+		return observed.inventory, observed.hotbar
 	end
 end
 
@@ -461,16 +478,20 @@ local function equipSlot(slot)
 end
 
 local function equipSword()
-	local inv = inventory()
-	if inv and inv.items then
-		if isSword(inv.hand) then
-			return inv.hand.tool
-		end
-		for slot, item in pairs(inv.items) do
-			if isSword(item) then
-				equipSlot(slot)
-				return item.tool
-			end
+	local inv, hotbar = inventory()
+	if not inv then return handTool() end
+	if isSword(inv.hand) and not Life.isPearl(inv.hand.itemType) and not Life.isPearl(inv.hand.tool) then
+		return inv.hand.tool
+	end
+	hotbar = hotbar or inv.hotbar
+	if type(hotbar) ~= "table" then return handTool() end
+	local offset = hotbar[0] ~= nil and 0 or 1
+	for index, entry in pairs(hotbar) do
+		local item = type(entry) == "table" and (entry.item or entry)
+		if type(index) == "number" and type(item) == "table" and (item.amount or 1) > 0
+			and not Life.isPearl(item.itemType) and not Life.isPearl(item.tool) and isSword(item) then
+			equipSlot(index - offset)
+			return item.tool
 		end
 	end
 	return handTool()
@@ -617,7 +638,7 @@ local function setMissBypass(on)
 	end)
 end
 
-local function lineOfSight(targetRoot)
+local function lineOfSight(targetRoot, ignoreCamera)
 	local me = root()
 	if not me or not cam or not targetRoot then
 		return false
@@ -625,6 +646,9 @@ local function lineOfSight(targetRoot)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	local ignore = { char() }
+	if ignoreCamera then
+		table.insert(ignore, cam)
+	end
 	if targetRoot.Parent then
 		table.insert(ignore, targetRoot.Parent)
 	end
@@ -652,14 +676,28 @@ local function pick(range, o)
 	end
 	local best, bestRoot, bestScore, bestDist
 	local candidates = o.candidates and {}
+	local center = o.viewportRadius and cam and cam.ViewportSize * 0.5
+	local localTeam = o.allowUnassigned and teamOf(lp)
 	for _, plr in ipairs(Players:GetPlayers()) do
 		local model = plr.Character
 		local r = model and (model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart)
 		local hp = model and healthOf(model) or 0
-		if plr ~= lp and r and r:IsA("BasePart") and model:IsDescendantOf(workspace) and not model:FindFirstChildOfClass("ForceField") and hp > 0 and (o.teams or enemy(plr)) then
+		if plr ~= lp and r and r:IsA("BasePart") and model:IsDescendantOf(workspace)
+			and not model:FindFirstChildOfClass("ForceField") and hp > 0
+			and (o.teams or enemy(plr) or (o.allowUnassigned and (localTeam == nil or teamOf(plr) == nil))) then
 			local d = (r.Position - me.Position).Magnitude
 			local ok = d <= range
-			if ok and o.screen then
+			local viewportDistance
+			if ok and o.viewportRadius then
+				ok = false
+				if center then
+					local point, onScreen = cam:WorldToViewportPoint(r.Position)
+					if onScreen and point.Z > 0 then
+						viewportDistance = (Vector2.new(point.X, point.Y) - center).Magnitude
+						ok = viewportDistance <= o.viewportRadius
+					end
+				end
+			elseif ok and o.screen then
 				local point,onScreen
 				if cam then point,onScreen=cam:WorldToViewportPoint(r.Position) end
 				ok=onScreen==true and point.Z>0
@@ -667,10 +705,13 @@ local function pick(range, o)
 				ok = inFov(r, o.fov)
 			end
 			if ok and o.visible then
-				ok = lineOfSight(r)
+				ok = lineOfSight(r, o.ignoreCamera)
 			end
 			if ok then
-				local score = d
+				if not candidates and plr == o.preferred then
+					return plr, r, d
+				end
+				local score = viewportDistance or d
 				if o.sort == "Health" then
 					score = hp
 				elseif o.sort == "Angle" and cam then
@@ -2419,6 +2460,80 @@ local function noM1Gate(m)
 	return get(m, "Click only") and not held(M1)
 end
 
+do
+	local renderKey = "FalconAimAssist"
+
+	add("Combat", "Aim Assist", "Tracks visible enemies inside the FOV circle", function(m)
+		opt(m, "Strength", "slider", 25, { suffix = "%" })
+		opt(m, "FOV radius", "slider", 120, { min = 20, max = 400, step = 5, suffix = " px" })
+	end, function(on, m)
+		if not on then
+			RunService:UnbindFromRenderStep(renderKey)
+			return
+		end
+
+		local host = lp and lp:FindFirstChildOfClass("PlayerGui")
+		if not host then error("PlayerGui unavailable") end
+		local gui = Instance.new("ScreenGui")
+		table.insert(m.conns, gui)
+		gui.Name = "FalconAimAssist"
+		gui.ResetOnSpawn = false
+		gui.ScreenInsets = Enum.ScreenInsets.None
+
+		local circle = Instance.new("Frame")
+		circle.AnchorPoint = Vector2.new(0.5, 0.5)
+		circle.Position = UDim2.fromScale(0.5, 0.5)
+		circle.BackgroundTransparency = 1
+		circle.Visible = false
+		circle.Parent = gui
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0.5, 0)
+		corner.Parent = circle
+
+		local stroke = Instance.new("UIStroke")
+		stroke.Thickness = 1
+		stroke.Color = Color3.new(1, 1, 1)
+		stroke.Transparency = 0.35
+		stroke.Parent = circle
+		gui.Parent = host
+
+		local target
+		-- Run after camera updates so they cannot overwrite the assisted view in the same frame.
+		RunService:BindToRenderStep(renderKey, Enum.RenderPriority.Last.Value, function(dt)
+			local body = root()
+			local active = cam and cam.CameraType ~= Enum.CameraType.Scriptable
+				and body and healthOf(body.Parent) > 0 and not menuOpen and not UserInputService:GetFocusedTextBox()
+				and not Life.isPearl(Life.liveHandTool())
+			circle.Visible = active == true
+			local radius = get(m, "FOV radius")
+			circle.Size = UDim2.fromOffset(radius * 2, radius * 2)
+			local strength = get(m, "Strength") / 100
+			if not active or strength <= 0 then
+				target = nil
+				return
+			end
+
+			local targetRoot
+			target, targetRoot = pick(math.huge, {
+				viewportRadius = radius,
+				visible = true,
+				ignoreCamera = true,
+				allowUnassigned = true,
+				preferred = target,
+			})
+			if not targetRoot then return end
+
+			local current = cam.CFrame
+			local position = targetRoot.Position
+			if (position - current.Position).Magnitude < 0.001 then return end
+			local goal = CFrame.lookAt(current.Position, position)
+			local alpha = strength == 1 and 1 or 1 - (1 - strength ^ 3) ^ (dt * 60)
+			cam.CFrame = current:Lerp(goal, alpha)
+		end)
+	end)
+end
+
 add("Combat", "Reach", "Extends swings you aim yourself, no walls", function(m)
 	opt(m, "Range", "slider", 20, { min = 14, max = 20, suffix = " st" })
 	opt(m, "Only moving", "toggle", false)
@@ -2613,6 +2728,10 @@ do
 			local aim=Modules["Projectile Aimbot"]
 			local m=aura and aura.enabled and aura or aim and aim.enabled and aim
 			if not m then return table.unpack(results,1,results.n) end
+			if Life.isPearl(Life.liveHandTool()) or (type(launchData) == "table"
+				and (Life.isPearl(launchData.projectile) or Life.isPearl(launchData.projectileType) or Life.isPearl(launchData.itemType))) then
+				return table.unpack(results, 1, results.n)
+			end
 			local values = results[1]
 			m.launchCalls=(m.launchCalls or 0)+1
 			m.lastLaunch=os.clock()
@@ -2745,17 +2864,21 @@ do
 			m.status="Hook installed; waiting for a supported shot"
 		end
 		if menuOpen or UserInputService:GetFocusedTextBox() then m.status="Close menu to auto-fire";return end
-		if charging or os.clock()<(m.nextShot or 0) then return end
+		local tool = Life.liveHandTool()
+		if charging then
+			if tool ~= charging or Life.isPearl(tool) then release() end
+			return
+		end
+		if os.clock()<(m.nextShot or 0) then return end
 		if UserInputService:IsMouseButtonPressed(M1) then return end
-		if handKind()~="projectile" then m.status="Equip a bow, crossbow, fireball, or snowball";return end
+		local itemType = tool and tostring(tool:GetAttribute("itemType") or tool:GetAttribute("ItemType") or tool.Name):lower() or ""
+		if Life.isPearl(tool) or not (itemType:find("bow", 1, true) or itemType:find("fireball", 1, true)
+			or itemType:find("snowball", 1, true)) then
+			m.status="Equip a bow, crossbow, fireball, or snowball"
+			return
+		end
 		local t = pick(get(m, "Range"), { screen = get(m,"Full screen"), fov = get(m, "FOV"), visible = true, sort = "Angle" })
 		if not t then return end
-		local tool = handTool()
-		if typeof(tool)~="Instance" then m.status="Equipped projectile instance unavailable";return end
-		local character=char()
-		local hand=character and character:FindFirstChild("HandInvItem")
-		local equipped=tool.Parent==character or (hand and hand:IsA("ObjectValue") and hand.Value==tool)
-		if not equipped then m.status="Projectile is not currently equipped";return end
 		if tool:IsA("Tool") and not tool.Enabled then m.status="Equipped projectile is on cooldown";return end
 		m.nextShot = os.clock() + (get(m, "Charge") + get(m, "Fire delay")) / 1000
 		charging = tool
@@ -2820,7 +2943,7 @@ local function releaseAuraFacing()
 	end
 	auraFacingHumanoid, auraAutoRotate, auraFacingRoot = nil, nil, nil
 end
-local function faceAuraTarget(targetRoot, m)
+local function faceAuraTarget(targetRoot)
 	local r, h = root(), hum()
 	if not r or not h or not targetRoot or h.Health <= 0 or h.Sit or h.PlatformStand then releaseAuraFacing(); return end
 	local position = r.Position
@@ -2832,13 +2955,7 @@ local function faceAuraTarget(targetRoot, m)
 	end
 	auraFacingRoot = r
 	h.AutoRotate = false
-	local pitch = 0
-	local mode = m and get(m, "Pitch mode") or "Flat"
-	if mode == "Target" then
-		local distance = (point - position).Magnitude
-		pitch = math.clamp(math.deg(math.atan2(targetRoot.Position.Y - position.Y, distance)), -60, 60)
-	elseif mode == "Custom" then pitch = math.clamp(tonumber(get(m, "Pitch angle")) or 0, -60, 60) end
-	r.CFrame = CFrame.lookAt(position, point) * CFrame.Angles(math.rad(pitch), 0, 0)
+	r.CFrame = CFrame.lookAt(position, point)
 end
 
 add("Blatant", "Killaura", "Attacks nearby targets with configurable timing and body rotation", function(m)
@@ -2853,8 +2970,6 @@ add("Blatant", "Killaura", "Attacks nearby targets with configurable timing and 
 	opt(m, "Swing", "toggle", true)
 	opt(m, "Weapon cooldown", "toggle", true)
 	opt(m, "Body rotation", "toggle", true)
-	opt(m, "Pitch mode", "list", "Target", { list = { "Target", "Custom", "Flat" } })
-	opt(m, "Pitch angle", "slider", -45, { min = -60, max = 60, step = 5, suffix = " deg (- = down)" })
 end, function(on, m)
 	if not on then releaseAuraFacing() end
 	if on and Modules["Silent Aura"] and Modules["Silent Aura"].enabled then setOn(Modules["Silent Aura"],false) end
@@ -2904,7 +3019,7 @@ end, function(m)
 			end
 			return a.score < b.score
 		end)
-		if get(m, "Body rotation") and candidates[1] then faceAuraTarget(candidates[1].root, m)
+		if get(m, "Body rotation") and candidates[1] then faceAuraTarget(candidates[1].root)
 		else releaseAuraFacing() end
 		for i = 1, math.min(#candidates, get(m, "Max targets") or 3) do
 			local target = candidates[i]
@@ -2913,7 +3028,7 @@ end, function(m)
 		end
 	else
 		local t, r = pick(get(m, "Range"), { fov = get(m, "FOV"), visible = not walls, sort = get(m, "Priority") })
-		if t and get(m, "Body rotation") then faceAuraTarget(r, m) else releaseAuraFacing() end
+		if t and get(m, "Body rotation") then faceAuraTarget(r) else releaseAuraFacing() end
 		if t then
 			sendAttack(t, r, mode, cfg)
 		end
