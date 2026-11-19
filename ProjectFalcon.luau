@@ -945,7 +945,7 @@ do
 		end
 		return now>=retryAt
 	end
-	local function damageRemote()
+	function Life.blockDamageRemote()
 		if remote then return remote end
 		if nextLoad and os.clock()<nextLoad then return end
 		nextLoad=os.clock()+3
@@ -958,13 +958,20 @@ do
 		end
 		return remote
 	end
+	function Life.requestBlockDamage(client, grid, position, normal)
+		return client:CallServerAsync({
+			blockRef = { blockPosition = grid },
+			hitPosition = position,
+			hitNormal = normal or Vector3.yAxis,
+		})
+	end
 	mineBlock=function(part,autoTool,hitPosition,normal,toolKind,blockCell)
 		local mod=Modules and Modules.Nuker
 		if not part or not part:IsA("BasePart") or not part.Parent or not root() then return false end
 		if part:GetAttribute("NoBreak")==true then setMiningTarget(nil);return false end
 		setMiningTarget(part)
 		if not miningReady() then return false end
-		local client=damageRemote()
+		local client=Life.blockDamageRemote()
 		if not client then
 			setMiningTarget(nil)
 			retryAt=os.clock()+3
@@ -1012,13 +1019,7 @@ do
 			mod.mineSent=(mod.mineSent or 0)+1
 			mod.status="Damage request #" .. mod.mineSent .. " for " .. part.Name .. "; waiting for server"
 		end
-		local ok,promise=pcall(function()
-			return client:CallServerAsync({
-				blockRef={blockPosition=grid},
-				hitPosition=position,
-				hitNormal=normal or Vector3.yAxis,
-			})
-		end)
+		local ok,promise=pcall(Life.requestBlockDamage,client,grid,position,normal)
 		if not ok then
 			pending,remote=nil,nil
 			retryAt=os.clock()+1
@@ -1318,6 +1319,7 @@ cat("Combat")
 cat("Blatant")
 cat("Kits")
 cat("Render")
+cat("Visuals")
 cat("World")
 cat("Larping")
 cat("False Ban")
@@ -2910,7 +2912,8 @@ add("Combat", "AutoClicker", "Swings or places blocks while you hold M1", functi
 	opt(m, "Place blocks", "toggle", true)
 	opt(m, "Randomize", "toggle", true)
 end, nil, function(m)
-	if not held(M1) then
+	if not held(M1) or menuOpen or UserInputService:GetFocusedTextBox()
+		or (Modules["Auto Lassy"] and Modules["Auto Lassy"].casting) then
 		return
 	end
 	if handKind() == "block" then
@@ -3294,7 +3297,91 @@ do
 end
 
 do
+	local controller, originalLaunch, wrappedLaunch
+	local function unhook()
+		if controller and controller.launchSelf == wrappedLaunch then
+			controller.launchSelf = originalLaunch
+		end
+		controller, originalLaunch, wrappedLaunch = nil, nil, nil
+	end
+
+	local function install(m)
+		local controllers = BW.knit and BW.knit.Controllers
+		local cannon = controllers and controllers.CannonHandController
+		if cannon == controller and wrappedLaunch and cannon.launchSelf == wrappedLaunch then return end
+		unhook()
+		if not cannon or type(cannon.launchSelf) ~= "function" then
+			m.status = "Waiting for cannon controller"
+			return
+		end
+		local client = Life.blockDamageRemote()
+		if not m.enabled or not Life.active then return end
+		if not client then
+			m.status = "Waiting for block damage controller"
+			return
+		end
+		local launch = cannon.launchSelf
+		local latestHit
+		local function onLaunch(self, block, ...)
+			local character = char()
+			local result = table.pack(launch(self, block, ...))
+			if result[1] == false or not Life.active or not m.enabled or wrappedLaunch ~= onLaunch then
+				return table.unpack(result, 1, result.n)
+			end
+			local ok, err = pcall(function()
+				if typeof(block) ~= "Instance" or not block:IsA("BasePart") or not block.Parent
+					or block:GetAttribute("PlacedByUserId") ~= lp.UserId or block:GetAttribute("NoBreak")
+					or lp:GetAttribute("DenyBlockBreak") or not character or char() ~= character then return end
+				local r = root()
+				local position = block.Position
+				if not r or (r.Position - position).Magnitude >= 30 then return end
+				local blocks = BW.blockController
+				local grid = blocks and type(blocks.getBlockPosition) == "function"
+					and blocks:getBlockPosition(position) or snap3(position)
+				if blocks and type(blocks.isBlockBreakable) == "function"
+					and not blocks:isBlockBreakable({ blockPosition = grid }, lp) then return end
+
+				local hit = {}
+				latestHit = hit
+				local function report(status)
+					if Life.active and m.enabled and wrappedLaunch == onLaunch and latestHit == hit then
+						m.status = status
+					end
+				end
+				report("Mining cannon")
+				local response = Life.requestBlockDamage(client, grid, position)
+				local chain = response:andThen(function(reply)
+					if reply == "destroyed" then
+						report("Cannon broken")
+					elseif reply == "damaged" then
+						report("Cannon still standing. Weaken it before launching.")
+					else
+						report("Cannon break unconfirmed")
+					end
+				end)
+				if chain and type(chain.catch) == "function" then
+					chain:catch(function() report("Cannon mining request failed") end)
+				end
+			end)
+			if not ok and wrappedLaunch == onLaunch then
+				m.status = "Cannon mining failed"
+				warn("[Falcon] Auto Davey: " .. tostring(err))
+			end
+			return table.unpack(result, 1, result.n)
+		end
+		controller, originalLaunch, wrappedLaunch = cannon, launch, onLaunch
+		cannon.launchSelf = onLaunch
+		m.status = "Waiting for self-launch from your cannon"
+	end
+
+	add("Kits", "Auto Davey", "Mine your own cannon immediately after launching yourself.", nil, function(on, m)
+		if not on then unhook(); m.status = nil end
+	end, install, 0.25)
+end
+
+do
 	local cast, nextCast
+	local lassy
 	local function inventoryState()
 		local ok, state = pcall(function() return BW.store:getState().Inventory.observedInventory end)
 		return ok and state or nil
@@ -3302,126 +3389,50 @@ do
 	local function restoreSlot()
 		local prior = cast
 		cast = nil
+		if lassy then lassy.casting = false end
+		if prior and prior.release then pcall(prior.release) end
 		if not prior or char() ~= prior.character or prior.previous == prior.slot then return end
 		local state = inventoryState()
 		if state and state.hotbarSlot == prior.slot then equipSlot(prior.previous) end
 	end
-	local function pullable(body, player, range)
-		local model = player.Character
-		local target = model and (model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart)
-		if player == lp or not enemy(player) or not target or not target:IsDescendantOf(workspace)
-			or healthOf(model) <= 0 or model:FindFirstChildOfClass("ForceField") then return end
-		local delta = target.Position - body.Position
-		if delta.Magnitude > range or delta.Magnitude < 0.1 then return end
-		local params = RaycastParams.new()
-		params.FilterType = Enum.RaycastFilterType.Exclude
-		local ignore = {body.Parent, model}
-		if workspace.CurrentCamera then table.insert(ignore, workspace.CurrentCamera) end
-		params.FilterDescendantsInstances = ignore
-		params.RespectCanCollide = true
-		if not workspace:Raycast(body.Position, delta, params) then return target end
-	end
-	local function bestPullable(body, range, priority)
-		local best, bestPart, distance, health = nil, nil, math.huge, math.huge
-		for _, player in ipairs(Players:GetPlayers()) do
-			local target = pullable(body, player, range)
-			if target then
-				local d, hp = (target.Position - body.Position).Magnitude, healthOf(player.Character)
-				if (priority == "Nearest" and d < distance)
-					or (priority ~= "Nearest" and (hp < health or (hp == health and d < distance))) then
-					best, bestPart, distance, health = player, target, d, hp
-				end
-			end
+	local function pressLasso(tool, character)
+		if type(mouse1press) == "function" and type(mouse1release) == "function" then
+			if pcall(mouse1press) then return mouse1release end
 		end
-		return best, bestPart
+		if VirtualInput then
+			local function mouseButton(down)
+				local pointer = UserInputService:GetMouseLocation()
+				VirtualInput:SendMouseButtonEvent(pointer.X, pointer.Y, 0, down, game, 0)
+			end
+			if pcall(mouseButton, true) then return function() mouseButton(false) end end
+		end
+		if tool:IsA("Tool") and tool.Parent == character and pcall(tool.Activate, tool) then
+			return function() tool:Deactivate() end
+		end
 	end
 
-	local function diagnose(m)
-		if m.diagnosed then return end
-		local lines = {"[Falcon Auto Lassy] BEGIN controller diagnostic"}
-		local found = false
-		local function describe(name, object)
-			if type(object) ~= "table" then return end
-			found = true
-			local methods, seen = {}, {}
-			local function inspect(t)
-				if type(t) ~= "table" then return end
-				for key, fn in pairs(t) do
-					if type(fn) == "function" and not seen[key] then
-						seen[key] = true
-						methods[#methods + 1] = {name = tostring(key), fn = fn}
-					end
-				end
-			end
-			inspect(object)
-			local mt = getmetatable(object)
-			if type(mt) == "table" then inspect(mt.__index) end
-			table.sort(methods, function(x, y) return x.name < y.name end)
-			lines[#lines + 1] = "Controller: " .. name
-			for _, method in ipairs(methods) do
-				local detail = "  " .. method.name
-				if type(dbg.info) == "function" then
-					local ok, count = pcall(dbg.info, method.fn, "a")
-					if ok and type(count) == "number" then detail ..= " (parameters=" .. count .. ")" end
-				end
-				lines[#lines + 1] = detail
-				local visited = {}
-				local function constants(fn, depth)
-					if type(fn) ~= "function" or visited[fn] or depth > 2 then return end
-					visited[fn] = true
-					if type(dbg.getconstants) == "function" then
-						local ok, values = pcall(dbg.getconstants, fn)
-						if ok and type(values) == "table" then
-							local names = {}
-							for _, value in ipairs(values) do
-								-- Only identifier-shaped constants: no runtime values or player data.
-								if type(value) == "string" and #value <= 80 and value:match("^[%a_][%w_%-%.]*$") then
-									names[#names + 1] = value
-								end
-							end
-							if #names > 0 then lines[#lines + 1] = "    identifiers: " .. table.concat(names, ", ") end
-						end
-					end
-					if depth < 2 and type(dbg.getprotos) == "function" then
-						local ok, protos = pcall(dbg.getprotos, fn)
-						if ok and type(protos) == "table" then for _, proto in pairs(protos) do constants(proto, depth + 1) end end
-					end
-				end
-				constants(method.fn, 0)
-			end
-		end
-		local controllers = BW.knit and BW.knit.Controllers
-		if type(controllers) == "table" then
-			for name, controller in pairs(controllers) do
-				local key = tostring(name):lower()
-				if key:find("lass", 1, true) or key:find("cowboy", 1, true) then describe(tostring(name), controller) end
-			end
-		end
-		if not found then
-			lines[#lines + 1] = "No Lasso/Lassy controller found in Knit.Controllers."
-			-- Locate the real module without requiring or executing unknown modules.
-			local scripts = lp:FindFirstChild("PlayerScripts")
-			if scripts then
-				for _, object in ipairs(scripts:GetDescendants()) do
-					local name = object.Name:lower()
-					if object:IsA("ModuleScript") and (name:find("lass", 1, true) or name:find("cowboy", 1, true)) then
-						lines[#lines + 1] = "Module: " .. object:GetFullName()
-					end
-				end
-			end
-		end
-		lines[#lines + 1] = "[Falcon Auto Lassy] END controller diagnostic"
-		for _, line in ipairs(lines) do print(line) end
-		m.diagnosed = true
+	local function aimAt(target)
+		local camera = workspace.CurrentCamera
+		if not camera then return false end
+		local view = camera.CFrame
+		local direction = target.Position - view.Position
+		if direction.Magnitude < 0.001 then return false end
+		local mouse = lp:GetMouse()
+		local ray = camera:ScreenPointToRay(mouse.X, mouse.Y)
+		local turn = CFrame.fromRotationBetweenVectors(ray.Direction.Unit, direction.Unit)
+		camera.CFrame = CFrame.new(view.Position) * turn * view.Rotation
+		return true
 	end
+
 	table.insert(Life.cleanups, restoreSlot)
-	local lassy = add("Kits", "Auto Lassy", "Throw integration unavailable: tap Cast key to inspect a reachable target and print F9 diagnostics", function(m)
+	lassy = add("Kits", "Auto Lassy", "Visibly aims at an on-screen enemy, charges the lasso, and releases with the Cast key.", function(m)
 		opt(m, "Cast key", "bind", Enum.KeyCode.V)
-		opt(m, "Range", "slider", 30, {min = 5, max = 50, suffix = " st"})
-		opt(m, "Priority", "list", "Lowest health", {list = {"Lowest health", "Nearest"}})
+		opt(m, "Range", "slider", 30, { min = 5, max = 50, suffix = " st" })
+		opt(m, "Charge", "slider", 750, { min = 500, max = 1500, step = 50, suffix = "ms" })
 	end, function(on, m)
-		m.requested, m.diagnosed = false, false
-		if not on then restoreSlot() else m.status = "Needs lasso integration · tap Cast key for F9 details" end
+		m.requested = false
+		if not on then restoreSlot() end
+		m.status = on and "Face an enemy, then press Cast key" or nil
 	end, function(m)
 		local now = os.clock()
 		if not cast then
@@ -3432,23 +3443,27 @@ do
 				return
 			end
 		end
-		if menuOpen or UserInputService:GetFocusedTextBox() then restoreSlot(); return end
-		if UserInputService:IsMouseButtonPressed(M1) then restoreSlot(); m.status = "Release attack before casting"; return end
-		local body, character = root(), char()
-		if not character or not body or healthOf(character) <= 0 then restoreSlot(); return end
-		local target, aimPart
-		local range = cast and cast.range or get(m, "Range")
-		if cast then
-			target = cast.target
-			if cast.character == character and cast.targetCharacter == target.Character then
-				aimPart = pullable(body, target, range)
-			end
-		else
-			target, aimPart = bestPullable(body, range, get(m, "Priority"))
+		if cast and cast.restoreAt then
+			if now >= cast.restoreAt then restoreSlot() end
+			return
 		end
-		if not aimPart then
+		if menuOpen or UserInputService:GetFocusedTextBox() then restoreSlot(); return end
+		if not (cast and cast.release) and UserInputService:IsMouseButtonPressed(M1) then
 			restoreSlot()
-			m.status = "No pullable enemy in range"
+			m.status = "Release attack before casting"
+			return
+		end
+		local character = char()
+		if not character or healthOf(character) <= 0 or (cast and cast.character ~= character) then
+			restoreSlot()
+			return
+		end
+		local target, aimPart = pick(get(m, "Range"), {
+			screen = true, visible = true, sort = "Angle", preferred = cast and cast.target,
+		})
+		if not aimPart or (cast and (target ~= cast.target or target.Character ~= cast.targetCharacter)) then
+			restoreSlot()
+			m.status = "Face a visible enemy in range"
 			return
 		end
 		local state = inventoryState()
@@ -3473,16 +3488,36 @@ do
 				character = character,
 				target = target,
 				targetCharacter = target.Character,
-				range = range,
 				previous = state.hotbarSlot,
 				slot = slot,
 				timeout = now + 1.25,
 			}
+			m.casting = true
 			if slot ~= state.hotbarSlot then
 				equipSlot(slot)
 				m.status = "Equipping lasso"
 				return
 			end
+		end
+		if cast.release then
+			if state.hotbarSlot ~= cast.slot or not inv or not inv.hand or inv.hand.tool ~= cast.tool then
+				restoreSlot()
+				m.status = "Lasso input interrupted"
+				return
+			end
+			local ok, aimed = pcall(aimAt, aimPart)
+			if not ok or not aimed then
+				restoreSlot()
+				m.status = "Lasso aim unavailable"
+				return
+			end
+			if now < cast.releaseAt then return end
+			local released = pcall(cast.release)
+			if released then cast.release = nil end
+			cast.restoreAt = now + 0.2
+			nextCast = now + 0.65
+			m.status = released and "Lasso input sent" or "Lasso release unconfirmed"
+			return
 		end
 		if state.hotbarSlot ~= cast.slot or not inv or not inv.hand or inv.hand.itemType ~= "lasso" then
 			cast.equippedAt = nil
@@ -3499,32 +3534,40 @@ do
 			if now >= cast.timeout then restoreSlot(); m.status = "Waiting for lasso tool" end
 			return
 		end
-		if cast.tool ~= tool or not cast.equippedAt then
-			cast.tool, cast.equippedAt = tool, now
+		if cast.previous ~= cast.slot then
+			if cast.tool ~= tool or not cast.equippedAt then cast.equippedAt = now end
+			if now - cast.equippedAt < 0.1 then
+				cast.tool = tool
+				if now >= cast.timeout then
+					restoreSlot()
+					m.status = "Lasso tool did not settle"
+				end
+				return
+			end
 		end
-		if now >= cast.timeout and now - cast.equippedAt < 0.1 then
-			restoreSlot()
-			m.status = "Lasso tool did not settle"
-			return
-		end
-		if now - cast.equippedAt < 0.1 then return end
 		if tool:IsA("Tool") and not tool.Enabled then
 			restoreSlot()
 			nextCast = now + 0.65
 			m.status = "Lasso is on cooldown"
 			return
 		end
-		-- Do not guess the throw API or hook shared camera/mouse methods.
-		-- Report actual controller methods so a supported adapter can be implemented.
-		local ok, err = pcall(diagnose, m)
-		restoreSlot()
-		nextCast = now + 0.65
-		if ok then
-			m.status = "Throw unavailable · copy Falcon Auto Lassy details from F9"
-		else
-			m.status = "Diagnostic failed · check F9 and retry"
-			warn("[Falcon Auto Lassy] Diagnostic failed: " .. tostring(err))
+		local ok, aimed = pcall(aimAt, aimPart)
+		if not ok or not aimed then
+			restoreSlot()
+			m.status = "Lasso aim unavailable"
+			return
 		end
+		local release = pressLasso(tool, character)
+		if not release then
+			restoreSlot()
+			m.status = "Lasso input unavailable"
+			return
+		end
+		cast.tool = tool
+		cast.release = release
+		cast.releaseAt = now + math.clamp(get(m, "Charge"), 500, 1500) / 1000
+		nextCast = now + 0.65
+		m.status = "Aiming and charging lasso"
 	end, 0.05)
 	function lassy.requestCast()
 		if lassy.enabled and not cast and not menuOpen and not UserInputService:GetFocusedTextBox() then lassy.requested = true end
@@ -3613,7 +3656,7 @@ do
 	}
 	local atmosphere, clouds, sky, originalAtmosphere, originalClouds, originalSky
 	local applied
-	add("Render", "Custom Skies", "Change the local horizon, clouds, and star field", function(m)
+	add("Visuals", "Custom Skies", "Change the local horizon, clouds, and star field", function(m)
 		opt(m, "Sky preset", "list", "Dusk", {list = {"Dusk", "Frost", "Ember"}})
 	end, function(on)
 		if on then
@@ -3661,7 +3704,7 @@ do
 		Warm = Color3.fromRGB(255, 219, 180),
 		Neutral = Color3.new(1, 1, 1),
 	}
-	add("Render", "Color Grade", "Add a cool, warm, or neutral color grade with adjustable contrast", function(m)
+	add("Visuals", "Color Grade", "Add a cool, warm, or neutral color grade with adjustable contrast", function(m)
 		opt(m, "Tone", "list", "Cool", {list = {"Cool", "Warm", "Neutral"}})
 		opt(m, "Strength", "slider", 35, {min = 0, max = 100, suffix = "%"})
 	end, function(on)
@@ -3680,6 +3723,404 @@ do
 		grade.Saturation = 0.12 * strength
 	end)
 end
+
+-- Potato Graphics changes appearance only: no streaming, geometry, or distance changes.
+do
+	local saved, queue, queued, head, tail, processed = {}, {}, {}, 1, 0, 0
+	local function change(obj, property, value)
+		local ok, current = pcall(function() return obj[property] end)
+		if not ok or current == value then return end
+		local record = saved[obj]
+		if not record then record = {}; saved[obj] = record end
+		local original = record[property]
+		local written = pcall(function() obj[property] = value end)
+		if written then
+			if original then original.applied = value else record[property] = {original = current, applied = value} end
+		end
+	end
+	local function restore()
+		for obj, properties in pairs(saved) do
+			for property, record in pairs(properties) do
+				pcall(function()
+					-- Preserve newer game changes and never reparent into a destroyed part.
+					if obj[property] == record.applied then
+						if property ~= "Parent" or (record.original and record.original.Parent) then obj[property] = record.original end
+					end
+				end)
+			end
+		end
+		table.clear(saved); table.clear(queue); table.clear(queued)
+		head, tail, processed = 1, 0, 0
+	end
+	local function enqueue(obj)
+		if queued[obj] then return end
+		queued[obj] = true
+		tail = tail + 1
+		queue[tail] = obj
+	end
+	local function simplify(obj)
+		if not obj:IsDescendantOf(workspace) and not obj:IsDescendantOf(Lighting) then return end
+		if obj:IsA("BasePart") then
+			change(obj, "Material", Enum.Material.SmoothPlastic)
+			change(obj, "MaterialVariant", "")
+			change(obj, "Reflectance", 0)
+			change(obj, "CastShadow", false)
+			-- Remove legacy studs/inlets as well as material and image textures.
+			for _, face in ipairs({"TopSurface", "BottomSurface", "LeftSurface", "RightSurface", "FrontSurface", "BackSurface"}) do
+				change(obj, face, Enum.SurfaceType.Smooth)
+			end
+			if obj:IsA("MeshPart") then
+				change(obj, "RenderFidelity", Enum.RenderFidelity.Performance)
+				change(obj, "TextureID", "")
+			elseif obj:IsA("UnionOperation") then
+				change(obj, "UsePartColor", true)
+			end
+		elseif obj:IsA("Decal") or obj:IsA("Texture") then
+			change(obj, "Transparency", 1)
+			change(obj, "Texture", "")
+		elseif obj:IsA("SurfaceAppearance") then
+			change(obj, "Parent", nil)
+		elseif obj:IsA("SpecialMesh") then
+			change(obj, "TextureId", "")
+		elseif obj:IsA("SurfaceGui") then
+			-- Some maps draw block patterns using face-mounted UI instead of decals.
+			change(obj, "Enabled", false)
+		elseif obj:IsA("Shirt") then
+			change(obj, "ShirtTemplate", "")
+		elseif obj:IsA("Pants") then
+			change(obj, "PantsTemplate", "")
+		elseif obj:IsA("ShirtGraphic") then
+			change(obj, "Graphic", "")
+		elseif obj:IsA("CharacterMesh") then
+			change(obj, "BaseTextureId", 0)
+			change(obj, "OverlayTextureId", 0)
+		elseif obj:IsA("Clouds") then
+			change(obj, "Enabled", false)
+		elseif obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Beam")
+			or obj:IsA("Fire") or obj:IsA("Smoke") or obj:IsA("Sparkles") or obj:IsA("PostEffect") then
+			change(obj, "Enabled", false)
+		elseif obj:IsA("Light") then
+			change(obj, "Shadows", false)
+			change(obj, "Enabled", false)
+		end
+	end
+	add("Visuals", "Potato Graphics", "Bare colors: strip textures, studs, clothing details, surface graphics, and lighting effects", nil, function(on, m)
+		restore()
+		if not on then m.status = "Original graphics restored"; return end
+		change(Lighting, "GlobalShadows", false)
+		change(Lighting, "EnvironmentDiffuseScale", 0)
+		change(Lighting, "EnvironmentSpecularScale", 0)
+		-- White ambient light preserves each part's color without sun/light shading.
+		change(Lighting, "Ambient", Color3.new(1, 1, 1))
+		change(Lighting, "OutdoorAmbient", Color3.new(1, 1, 1))
+		change(Lighting, "Brightness", 0)
+		change(Lighting, "ColorShift_Top", Color3.new(0, 0, 0))
+		change(Lighting, "ColorShift_Bottom", Color3.new(0, 0, 0))
+		local terrain = workspace.Terrain
+		if terrain then
+			change(terrain, "Decoration", false)
+			change(terrain, "WaterWaveSize", 0)
+			change(terrain, "WaterWaveSpeed", 0)
+			change(terrain, "WaterReflectance", 0)
+		end
+		-- Process a bounded batch each frame, including subsequently streamed objects.
+		table.insert(m.conns, workspace.DescendantAdded:Connect(enqueue))
+		table.insert(m.conns, Lighting.DescendantAdded:Connect(enqueue))
+		for _, obj in ipairs(workspace:GetDescendants()) do enqueue(obj) end
+		for _, obj in ipairs(Lighting:GetDescendants()) do enqueue(obj) end
+		m.status = "Simplifying graphics..."
+	end, function(m)
+		local started, count = os.clock(), 0
+		while head <= tail and count < 200 and os.clock() - started < 0.003 do
+			local obj = queue[head]
+			queue[head], head = nil, head + 1
+			queued[obj] = nil
+			simplify(obj)
+			count, processed = count + 1, processed + 1
+		end
+		if head > tail then table.clear(queue); head, tail = 1, 0 end
+		m.status = head <= tail and ("Simplifying graphics: " .. processed .. " objects") or "Potato active / render distance unchanged"
+	end, 0)
+end
+-- End Potato Graphics.
+
+-- Falcon cosmetic effects: local geometry only, with independent lifetimes.
+do
+	local themes = {"Supernova", "Glacier", "Inferno", "Toxic", "Rainbow"}
+	local palettes = {
+		Supernova = {Color3.fromRGB(178, 75, 255), Color3.fromRGB(55, 235, 255)},
+		Glacier = {Color3.fromRGB(80, 180, 255), Color3.fromRGB(210, 255, 255)},
+		Inferno = {Color3.fromRGB(255, 65, 90), Color3.fromRGB(255, 195, 60)},
+		Toxic = {Color3.fromRGB(100, 255, 70), Color3.fromRGB(30, 235, 190)},
+	}
+	local function colors(m, time)
+		local palette = palettes[get(m, "Theme")]
+		if palette then return palette[1], palette[2] end
+		return Color3.fromHSV((time * 0.12) % 1, 0.75, 1), Color3.fromHSV((time * 0.12 + 0.22) % 1, 0.7, 1)
+	end
+	local function themeOption(m)
+		opt(m, "Theme", "list", "Supernova", {list = themes})
+	end
+	local function effectFolder(name)
+		local folder = Instance.new("Folder")
+		folder.Name = "Falcon" .. name
+		folder.Parent = workspace
+		return folder
+	end
+	local function neon(parent, name)
+		local part = Instance.new("Part")
+		part.Name = name
+		part.Anchored = true
+		part.CanCollide = false
+		part.CanTouch = false
+		part.CanQuery = false
+		part.CastShadow = false
+		part.Material = Enum.Material.Neon
+		part.Size = Vector3.new(0.1, 0.1, 0.1)
+		part.Parent = parent
+		return part
+	end
+	local function ring(parent, segments)
+		local parts = {}
+		for i = 1, segments do parts[i] = neon(parent, "Arc") end
+		return parts
+	end
+	local function drawRing(parts, frame, radius, width, color, transparency, phase)
+		for i, part in ipairs(parts) do
+			local a = (i - 1) / #parts * math.pi * 2 + phase
+			local b = i / #parts * math.pi * 2 + phase
+			local p = frame:PointToWorldSpace(Vector3.new(math.cos(a) * radius, 0, math.sin(a) * radius))
+			local q = frame:PointToWorldSpace(Vector3.new(math.cos(b) * radius, 0, math.sin(b) * radius))
+			part.Size = Vector3.new(width, width, (q - p).Magnitude + width * 0.25)
+			part.CFrame = CFrame.lookAt((p + q) / 2, q)
+			part.Color = color
+			part.Transparency = math.clamp(transparency + (0.5 + 0.5 * math.sin(a * 3 - phase * 2)) * 0.23, 0, 1)
+		end
+	end
+	local function ribbon(parent, a, b, lifetime)
+		local trail = Instance.new("Trail")
+		trail.Attachment0, trail.Attachment1 = a, b
+		trail.Lifetime = lifetime
+		trail.MinLength = 0.04
+		trail.FaceCamera = true
+		trail.LightEmission = 1
+		trail.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.08), NumberSequenceKeypoint.new(0.55, 0.4), NumberSequenceKeypoint.new(1, 1)})
+		trail.WidthScale = NumberSequence.new({NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, 0)})
+		trail.Parent = parent
+		return trail
+	end
+	local function animate(m, callback)
+		table.insert(m.conns, RunService.RenderStepped:Connect(function(dt)
+			if not Life.active or not m.enabled then return end
+			local ok, err = pcall(callback, dt)
+			if not ok then
+				m.status = "Visual error: " .. tostring(err)
+				warn("[Falcon] " .. m.name .. ": " .. tostring(err))
+				setOn(m, false, true)
+			end
+		end))
+	end
+	local function showCharacterEffect(m, actor)
+		if Modules["Potato Graphics"].enabled then return false end
+		return actor and actor.Parent and (get(m, "First person") or not cam or (cam.CFrame.Position - actor.Position).Magnitude > 2.5)
+	end
+
+	-- Two tilted energy rings and four comet-like satellites around the local avatar.
+	do
+		local folder, inner, outer, satellites, previous
+		add("Visuals", "Astral Aura", "Tilted neon rings and orbiting comet diamonds around your avatar", function(m)
+			themeOption(m)
+			opt(m, "Radius", "slider", 3.8, {min = 2, max = 7, step = 0.1, suffix = " studs"})
+			opt(m, "Orbit speed", "slider", 1, {min = 0.2, max = 3, step = 0.1})
+			opt(m, "First person", "toggle", false)
+		end, function(on, m)
+			if not on then
+				if folder then folder:Destroy() end
+				folder, inner, outer, satellites, previous = nil, nil, nil, nil, nil
+				return
+			end
+			folder = effectFolder("AstralAura")
+			inner, outer, satellites = ring(folder, 32), ring(folder, 32), {}
+			for i = 1, 4 do
+				local part = neon(folder, "Comet")
+				part.Size = Vector3.new(0.28, 0.28, 0.28)
+				local a, b = Instance.new("Attachment"), Instance.new("Attachment")
+				a.Position, b.Position = Vector3.new(0, 0.14, 0), Vector3.new(0, -0.14, 0)
+				a.Parent, b.Parent = part, part
+				satellites[i] = {part = part, trail = ribbon(part, a, b, 0.45)}
+			end
+			animate(m, function()
+				local actor = root()
+				local visible = showCharacterEffect(m, actor)
+				folder.Parent = visible and workspace or nil
+				if not visible then
+					for _, satellite in ipairs(satellites) do satellite.trail:Clear() end
+					previous = nil
+					return
+				end
+				local time = os.clock() * get(m, "Orbit speed")
+				local primary, secondary = colors(m, time)
+				local radius = get(m, "Radius")
+				local frame = CFrame.new(actor.Position)
+				drawRing(inner, frame * CFrame.Angles(0.38, time * 0.35, 0.2), radius, 0.055, primary, 0.15, time)
+				drawRing(outer, frame * CFrame.Angles(-0.48, -time * 0.24, -0.32), radius * 1.12, 0.04, secondary, 0.23, -time)
+				local jumped = previous and (previous - actor.Position).Magnitude > 20
+				for i, satellite in ipairs(satellites) do
+					local angle = time * 1.5 + i * math.pi / 2
+					local offset = Vector3.new(math.cos(angle) * radius, math.sin(angle * 2) * 0.85, math.sin(angle) * radius)
+					satellite.part.CFrame = CFrame.new(actor.Position + offset) * CFrame.Angles(time, angle, math.pi / 4)
+					satellite.part.Color = i % 2 == 0 and primary or secondary
+					satellite.trail.Color = ColorSequence.new(satellite.part.Color, secondary)
+					if not previous or jumped then satellite.trail:Clear() end
+				end
+				previous = actor.Position
+			end)
+		end)
+	end
+
+	do
+		local owned, trails, attached, previous = {}, {}, nil, nil
+		local function clear()
+			for i = #owned, 1, -1 do owned[i]:Destroy() end
+			table.clear(owned)
+			table.clear(trails)
+			attached, previous = nil, nil
+		end
+		add("Visuals", "Neon Trails", "Twin tapered energy ribbons following your movement", function(m)
+			themeOption(m)
+			opt(m, "Lifetime", "slider", 0.65, {min = 0.15, max = 1.5, step = 0.05, suffix = " s"})
+			opt(m, "Width", "slider", 0.8, {min = 0.2, max = 2, step = 0.1})
+			opt(m, "First person", "toggle", false)
+		end, function(on, m)
+			clear()
+			if not on then return end
+			animate(m, function()
+				local actor = root()
+				if actor ~= attached then
+					clear()
+					if actor then
+						attached = actor
+						for _, side in ipairs({-1, 1}) do
+							local a, b = Instance.new("Attachment"), Instance.new("Attachment")
+							table.insert(owned, a); table.insert(owned, b)
+							a.Name, b.Name = "FalconRibbonTop", "FalconRibbonBottom"
+							a.Parent, b.Parent = actor, actor
+							local trail = ribbon(actor, a, b, get(m, "Lifetime"))
+							table.insert(owned, trail)
+							table.insert(trails, {trail = trail, a = a, b = b, side = side})
+						end
+					end
+				end
+				if not actor then return end
+				local primary, secondary = colors(m, os.clock())
+				local visible = showCharacterEffect(m, actor)
+				local jumped = previous and (previous - actor.Position).Magnitude > 20
+				for _, entry in ipairs(trails) do
+					entry.a.Position = Vector3.new(entry.side * 0.9, get(m, "Width") / 2, 0.5)
+					entry.b.Position = Vector3.new(entry.side * 0.9, -get(m, "Width") / 2, 0.5)
+					entry.trail.Color = ColorSequence.new(primary, secondary)
+					entry.trail.Lifetime = get(m, "Lifetime")
+					entry.trail.Enabled = visible and true or false
+					if not visible or not previous or jumped then entry.trail:Clear() end
+				end
+				previous = actor.Position
+			end)
+		end)
+	end
+
+	do
+		local folder, waves, attached, grounded, lastEmission
+		local function emit(m, actor, landing)
+			-- Exclude cosmetic geometry and the avatar; align rings to the floor normal.
+			local params = RaycastParams.new()
+			params.FilterType = Enum.RaycastFilterType.Exclude
+			params.FilterDescendantsInstances = {actor.Parent, folder}
+			local hit = workspace:Raycast(actor.Position, Vector3.new(0, -12, 0), params)
+			if not hit then return end
+			if #waves >= 6 then table.remove(waves, 1).model:Destroy() end
+			local model = Instance.new("Folder")
+			model.Name, model.Parent = "Shockwave", folder
+			local normal = hit.Normal
+			local tangent = math.abs(normal.Y) > 0.98 and Vector3.xAxis or normal:Cross(Vector3.yAxis).Unit
+			local frame = CFrame.fromMatrix(hit.Position + normal * 0.08, tangent, normal, tangent:Cross(normal))
+			table.insert(waves, {model = model, parts = ring(model, 28), echo = ring(model, 28), frame = frame, born = os.clock(), landing = landing})
+		end
+		add("Visuals", "Jump Shockwaves", "Expanding double neon shockwaves on takeoff and landing", function(m)
+			themeOption(m)
+			opt(m, "Size", "slider", 7, {min = 3, max = 14, step = 0.5, suffix = " studs"})
+			opt(m, "Duration", "slider", 0.7, {min = 0.3, max = 1.5, step = 0.1, suffix = " s"})
+			opt(m, "Landing rings", "toggle", true)
+		end, function(on, m)
+			if folder then folder:Destroy() end
+			folder, waves, attached, grounded, lastEmission = nil, {}, nil, nil, -math.huge
+			if not on then return end
+			folder = effectFolder("JumpShockwaves")
+			animate(m, function()
+				local actor, humanoid = root(), hum()
+				local now = os.clock()
+				if Modules["Potato Graphics"].enabled then
+					for _, wave in ipairs(waves) do wave.model:Destroy() end
+					table.clear(waves)
+					grounded = nil
+					return
+				end
+				if actor ~= attached then
+					for _, wave in ipairs(waves) do wave.model:Destroy() end
+					table.clear(waves)
+					attached, grounded, lastEmission = actor, nil, -math.huge
+				end
+				if actor and humanoid and humanoid.Health > 0 then
+					local onGround = humanoid.FloorMaterial ~= Enum.Material.Air
+					if grounded ~= nil and onGround ~= grounded and now - lastEmission >= 0.12 then
+						if not onGround or get(m, "Landing rings") then emit(m, actor, onGround); lastEmission = now end
+					end
+					grounded = onGround
+				else
+					grounded = nil
+				end
+				local primary, secondary = colors(m, now)
+				for i = #waves, 1, -1 do
+					local wave = waves[i]
+					local age = (now - wave.born) / get(m, "Duration")
+					if age >= 1 then
+						wave.model:Destroy(); table.remove(waves, i)
+					else
+						local eased = 1 - (1 - age) ^ 3
+						local radius = 0.7 + eased * get(m, "Size") * (wave.landing and 1.15 or 1)
+						drawRing(wave.parts, wave.frame, radius, 0.09 * (1 - age) + 0.02, primary, age ^ 1.5, now * 0.4)
+						drawRing(wave.echo, wave.frame, radius * 0.78, 0.045, secondary, math.min(1, age ^ 1.5 + 0.15), -now * 0.3)
+					end
+				end
+			end)
+		end)
+	end
+
+	do
+		local bloom, rays
+		add("Visuals", "Cinematic Glow", "Soft neon bloom and sun shafts with adjustable intensity", function(m)
+			opt(m, "Intensity", "slider", 45, {min = 0, max = 100, suffix = "%"})
+			opt(m, "Bloom size", "slider", 32, {min = 12, max = 56, step = 2})
+			opt(m, "Sun rays", "toggle", true)
+		end, function(on, m)
+			if bloom then bloom:Destroy() end
+			if rays then rays:Destroy() end
+			bloom, rays = nil, nil
+			if not on then return end
+			bloom = Instance.new("BloomEffect")
+			bloom.Name, bloom.Parent = "FalconCinematicBloom", Lighting
+			rays = Instance.new("SunRaysEffect")
+			rays.Name, rays.Parent = "FalconCinematicRays", Lighting
+			animate(m, function()
+				bloom.Enabled = not Modules["Potato Graphics"].enabled
+				if not bloom.Enabled then rays.Enabled = false; return end
+				local intensity = get(m, "Intensity") / 100
+				bloom.Intensity, bloom.Size, bloom.Threshold = intensity * 1.4, get(m, "Bloom size"), 1.1
+				rays.Enabled, rays.Intensity, rays.Spread = get(m, "Sun rays"), intensity * 0.12, 0.75
+			end)
+		end)
+	end
+end
+-- End Falcon cosmetic effects.
 
 do
 	local function isRig(candidate)
@@ -3845,7 +4286,7 @@ do
 	local function useInput(input)
 		return input.UserInputType == Enum.UserInputType.MouseButton1 or input.KeyCode == Enum.KeyCode.ButtonR2
 	end
-	add("Render", "Hand Motion", "Smooth, slow first-person swings and item use", function(m)
+	add("Visuals", "Hand Motion", "Smooth, slow first-person swings and item use", function(m)
 		opt(m, "Duration", "slider", 720, {min = 350, max = 1200, step = 10, suffix = " ms"})
 		opt(m, "Intensity", "slider", 55, {min = 0, max = 100, suffix = "%"})
 		opt(m, "Sword style", "list", "Classic", {list = {"Classic", "Reverse Slash", "Flourish", "Heavy Swing"}})
@@ -4117,7 +4558,7 @@ do
 			end
 		end
 	end
-	local changer = add("Render", "Skin Changer", "Use locally available skins on your held swords and tools", function(m)
+	local changer = add("Visuals", "Skin Changer", "Use locally available skins on your held swords and tools", function(m)
 		opt(m, "Item", "list", "All", {list = {"All"}})
 		opt(m, "Skin", "list", "Original", {list = {"Original"}})
 		opt(m, "Refresh skins", "action", nil)
@@ -8334,7 +8775,7 @@ end
 fitMenu()
 Life.connect(screen:GetPropertyChangedSignal("AbsoluteSize"), fitMenu)
 
-local COLS = { "Combat", "Blatant", "Kits", "Render", "World", "Larping", "False Ban", "Settings" }
+local COLS = { "Combat", "Blatant", "Kits", "Render", "Visuals", "World", "Larping", "False Ban", "Settings" }
 local sidebar = Instance.new("Frame")
 sidebar.Size = UDim2.new(0, 182, 1, -151)
 sidebar.Position = UDim2.fromOffset(13, 94)
@@ -8985,7 +9426,8 @@ local categoryTips = {
 	Combat = "Aim, timing, and projectile controls",
 	Blatant = "Movement and extended combat controls",
 	Kits = "Kit-specific movement and ability controls",
-	Render = "Sky, color grading, hand motion, and player displays",
+	Render = "ESP, kit displays, projectile markers, and gameplay overlays",
+	Visuals = "Skies, color grading, cosmetic effects, and graphics quality",
 	World = "Block and environment tools",
 	Larping = "Local appearance and profile customization",
 	["False Ban"] = "Local player name and stat appearance",
@@ -9016,7 +9458,7 @@ local function applyFilter()
 end
 local function selectCategory(name)
 	activeCategory = name
-	categoryTitle.Text = name == "Render" and "Visuals" or name
+	categoryTitle.Text = name
 	categoryDetail.Text = (categoryTips[name] or "") .. "  /  " .. #Cats[name].modules .. " modules"
 	search.Text = ""
 	for category, button in pairs(navButtons) do
@@ -9040,7 +9482,7 @@ for index, name in ipairs(COLS) do
 	nav.TextSize = 15
 	nav.TextXAlignment = Enum.TextXAlignment.Left
 	nav.TextColor3 = DIM
-	nav.Text = name == "Render" and "Visuals" or name
+	nav.Text = name
 	nav.Parent = menu
 	corner(nav, 17)
 	navButtons[name] = nav
